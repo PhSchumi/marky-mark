@@ -1,0 +1,166 @@
+"""Benchmark configuration, presets and environment overrides."""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from wmbench.bootstrap import REPO_ROOT
+
+SCHEMA_VERSION = 1
+
+# Sampling is fixed to plain multinomial sampling at temperature 1. Only this setting gives
+# KGW/SIR (logit bias before tempering), MorphMark/SynthID (return log-probs of a reweighted
+# distribution) and PF (own decoding loop) the same base distribution. See README "Fairness".
+SAMPLING = {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0}
+
+DEFAULT_VARIANTS = ("none", "KGW", "MorphMark", "PF", "SynthID", "SIR")
+DEFAULT_DATASETS = ("c4", "wmt16_de_en", "cnn_dailymail")
+DETECTION_DATASETS = ("c4",)  # detection is measured on open-ended C4 continuations only
+
+
+@dataclass
+class BenchmarkConfig:
+    run_name: str = "full"
+    # --- model ------------------------------------------------------------------------
+    model_name: str = "facebook/opt-1.3b"  # PLACEHOLDER: swap for your Hugging Face model
+    tokenizer_name: str | None = None
+    trust_remote_code: bool = False
+    oracle_model_name: str | None = "facebook/opt-2.7b"  # PPL oracle; None = score with the generator
+    device: str = "auto"
+    dtype: str = "auto"  # auto -> fp16 on CUDA, fp32 elsewhere; or float16/bfloat16/float32
+    use_chat_template: bool | None = None  # None = auto-detect from tokenizer
+    system_prompt: str | None = None
+    # --- what to run -----------------------------------------------------------------
+    variants: tuple[str, ...] = DEFAULT_VARIANTS
+    datasets: tuple[str, ...] = DEFAULT_DATASETS
+    n_samples: dict[str, int] = field(default_factory=lambda: {
+        "c4": 500, "wmt16_de_en": 200, "cnn_dailymail": 100, "humaneval": 164})
+    max_new_tokens: dict[str, int] = field(default_factory=lambda: {
+        "c4": 200, "wmt16_de_en": 64, "cnn_dailymail": 96, "humaneval": 300})
+    seed: int = 0
+    shuffle_seed: int | None = None  # None = first n rows (MarkLLM convention)
+    # --- prompts ----------------------------------------------------------------------
+    translation_shots: int = 5
+    article_max_words: int = 400
+    max_prompt_tokens: int | None = None  # None = model max positions - max_new_tokens
+    # --- detection --------------------------------------------------------------------
+    min_detect_tokens: int = 50  # samples whose human text is shorter are excluded everywhere
+    target_fprs: tuple[float, ...] = (0.01, 0.05)
+    # --- optional tracks --------------------------------------------------------------
+    run_robustness: bool = False
+    word_deletion_ratio: float = 0.3
+    semstamp_n_max: int = 100
+    # --- per-variant JSON overrides, e.g. {"KGW": {"delta": 1.5}} ---------------------
+    watermark_overrides: dict[str, dict] = field(default_factory=dict)
+    # --- paths ------------------------------------------------------------------------
+    results_root: str = str(REPO_ROOT / "results")
+    smoke: bool = False
+
+    # ------------------------------------------------------------------ helpers
+    @property
+    def run_dir(self) -> Path:
+        return Path(self.results_root) / self.run_name
+
+    def as_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+    # Fields that select *which* work is done or how it is reported, not how records are produced.
+    # Array tasks with different --variants / --datasets must share one results directory.
+    _HASH_EXCLUDED = ("run_name", "results_root", "target_fprs", "smoke", "oracle_model_name",
+                      "min_detect_tokens", "variants", "datasets", "n_samples", "run_robustness")
+
+    def config_hash(self) -> str:
+        """Hash of everything that changes generated records (see ``_HASH_EXCLUDED``)."""
+        d = self.as_dict()
+        for k in self._HASH_EXCLUDED:
+            d.pop(k, None)
+        d["sampling"] = SAMPLING
+        return hashlib.sha1(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+    def with_updates(self, **kw) -> "BenchmarkConfig":
+        return dataclasses.replace(self, **kw)
+
+    # ------------------------------------------------------------------ presets
+    @classmethod
+    def full(cls, **kw) -> "BenchmarkConfig":
+        return cls(**kw)
+
+    @classmethod
+    def smoke_test(cls, **kw) -> "BenchmarkConfig":
+        """Tiny model, few samples, short generations: validates the pipeline on a CPU in minutes.
+
+        Numbers from this preset are not meaningful; the banner in the report says so.
+        """
+        base = dict(
+            run_name="smoke", model_name="facebook/opt-125m", oracle_model_name=None,
+            n_samples={"c4": 8, "wmt16_de_en": 6, "cnn_dailymail": 4, "humaneval": 4},
+            max_new_tokens={"c4": 64, "wmt16_de_en": 32, "cnn_dailymail": 48, "humaneval": 128},
+            min_detect_tokens=16, semstamp_n_max=4, translation_shots=3, article_max_words=200,
+            smoke=True,
+        )
+        base.update(kw)
+        return cls(**base)
+
+    @classmethod
+    def from_env(cls, **kw) -> "BenchmarkConfig":
+        """Preset selected by ``WMBENCH_SMOKE_TEST``; scalar fields overridable via ``WMBENCH_*``.
+
+        Recognised: WMBENCH_SMOKE_TEST (1/0), WMBENCH_MODEL, WMBENCH_ORACLE ("none" for None),
+        WMBENCH_RUN_NAME, WMBENCH_VARIANTS (comma list), WMBENCH_DATASETS (comma list),
+        WMBENCH_DEVICE, WMBENCH_DTYPE, WMBENCH_SEED, WMBENCH_RESULTS, WMBENCH_N_SAMPLES
+        (JSON object or a single int applied to every dataset), WMBENCH_ROBUSTNESS (1/0).
+        Explicit ``kw`` win over the environment.
+        """
+        env = os.environ
+        smoke = env.get("WMBENCH_SMOKE_TEST", "0").strip().lower() in ("1", "true", "yes")
+        cfg = cls.smoke_test() if smoke else cls.full()
+        upd: dict = {}
+        if v := env.get("WMBENCH_MODEL"):
+            upd["model_name"] = v
+        if (v := env.get("WMBENCH_ORACLE")) is not None:
+            upd["oracle_model_name"] = None if v.strip().lower() in ("", "none", "null") else v
+        if v := env.get("WMBENCH_RUN_NAME"):
+            upd["run_name"] = v
+        if v := env.get("WMBENCH_VARIANTS"):
+            upd["variants"] = tuple(x.strip() for x in v.split(",") if x.strip())
+        if v := env.get("WMBENCH_DATASETS"):
+            upd["datasets"] = tuple(x.strip() for x in v.split(",") if x.strip())
+        if v := env.get("WMBENCH_DEVICE"):
+            upd["device"] = v
+        if v := env.get("WMBENCH_DTYPE"):
+            upd["dtype"] = v
+        if v := env.get("WMBENCH_SEED"):
+            upd["seed"] = int(v)
+        if v := env.get("WMBENCH_RESULTS"):
+            upd["results_root"] = v
+        if v := env.get("WMBENCH_N_SAMPLES"):
+            v = v.strip()
+            if v.startswith("{"):
+                upd["n_samples"] = {**cfg.n_samples, **json.loads(v)}
+            else:
+                upd["n_samples"] = {k: int(v) for k in cfg.n_samples}
+        if v := env.get("WMBENCH_ROBUSTNESS"):
+            upd["run_robustness"] = v.strip().lower() in ("1", "true", "yes")
+        upd.update(kw)
+        return cfg.with_updates(**upd)
+
+
+def load_config_file(path: str | Path) -> BenchmarkConfig:
+    """Load a JSON or YAML config file produced by ``BenchmarkConfig.as_dict``."""
+    path = Path(path)
+    text = path.read_text()
+    if path.suffix in (".yaml", ".yml"):
+        import yaml
+
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+    for k in ("variants", "datasets", "target_fprs"):
+        if k in data and isinstance(data[k], list):
+            data[k] = tuple(data[k])
+    return BenchmarkConfig(**data)

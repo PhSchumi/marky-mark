@@ -1,0 +1,36 @@
+# Runtime dependencies for wmbench + the MarkLLM algorithms it uses.
+# Install torch first with the CUDA build matching your cluster, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# then `pip install -r requirements.txt`.
+#
+# Verified combination (2026-09): torch 2.10, transformers 5.3, Python 3.12 (macOS CPU/MPS smoke tests).
+torch>=2.1
+transformers>=4.45
+accelerate>=0.30
+huggingface_hub>=0.23
+sentencepiece>=0.1.99
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+pandas>=2.0
+matplotlib>=3.7
+tqdm>=4.65
+sacrebleu>=2.3
+rouge_score>=0.1.2
+nltk>=3.8
+jieba>=0.42
+sentence-transformers>=2.7
+NearPy>=1.0
+pyyaml>=6.0
+
+# Notebook execution (interactive or headless via nbconvert)
+jupyter
+ipykernel
+nbformat
+nbclient
+nbconvert
+ipywidgets
+
+# Tests
+pytest>=7
+pytest-timeout

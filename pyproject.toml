@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wmbench"
+version = "0.1.0"
+description = "Benchmark MarkLLM watermarking schemes (KGW, MorphMark, Permute-and-Flip, SynthID, SIR, SemStamp) on one Hugging Face model."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "torch>=2.1",
+  "transformers>=4.45",
+  "accelerate>=0.30",
+  "huggingface_hub>=0.23",
+  "sentencepiece>=0.1.99",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "scikit-learn>=1.3",
+  "pandas>=2.0",
+  "matplotlib>=3.7",
+  "tqdm>=4.65",
+  "sacrebleu>=2.3",
+  "rouge_score>=0.1.2",
+  "nltk>=3.8",
+  "jieba>=0.42",
+  "sentence-transformers>=2.7",
+  "NearPy>=1.0",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+notebook = ["jupyter", "ipykernel", "nbformat", "nbclient", "nbconvert", "ipywidgets"]
+dev = ["pytest>=7", "pytest-timeout"]
+
+[project.scripts]
+wmbench = "wmbench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wmbench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: integration tests that download models or clone MarkLLM (deselect with -m 'not slow')",
+]
+addopts = "-m 'not slow'"

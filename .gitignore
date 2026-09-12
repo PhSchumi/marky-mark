@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+build/
+dist/
+
+# Runtime artifacts (re-created by wmbench.bootstrap / scripts/prepare_assets.py)
+third_party/
+artifacts/
+results/
+hf_cache/
+*.log
+slurm-*.out
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
