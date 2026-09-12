@@ -13,14 +13,31 @@ from wmbench.bootstrap import REPO_ROOT
 
 SCHEMA_VERSION = 1
 
+CONFIG_DIR = REPO_ROOT / "configs" / "watermarks"
+
 # Sampling is fixed to plain multinomial sampling at temperature 1. Only this setting gives
 # KGW/SIR (logit bias before tempering), MorphMark/SynthID (return log-probs of a reweighted
 # distribution) and PF (own decoding loop) the same base distribution. See README "Fairness".
-SAMPLING = {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0}
+# repetition_penalty / no_repeat_ngram_size are pinned to their neutral values as documentation;
+# the hub generation_config of the model is additionally discarded in models.load_causal_lm.
+SAMPLING = {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0,
+            "repetition_penalty": 1.0, "no_repeat_ngram_size": 0}
 
 DEFAULT_VARIANTS = ("none", "KGW", "MorphMark", "PF", "SynthID", "SIR")
 DEFAULT_DATASETS = ("c4", "wmt16_de_en", "cnn_dailymail")
 DETECTION_DATASETS = ("c4",)  # detection is measured on open-ended C4 continuations only
+
+
+def watermark_config_digest(config_dir: Path | None = None) -> dict[str, str]:
+    """Canonical-JSON digest of every algorithm config file (whitespace edits do not count)."""
+    out = {}
+    for p in sorted((config_dir or CONFIG_DIR).glob("*.json")):
+        try:
+            canonical = json.dumps(json.loads(p.read_text()), sort_keys=True)
+        except json.JSONDecodeError:
+            canonical = p.read_text()
+        out[p.name] = hashlib.sha1(canonical.encode()).hexdigest()[:12]
+    return out
 
 
 @dataclass
@@ -47,7 +64,6 @@ class BenchmarkConfig:
     # --- prompts ----------------------------------------------------------------------
     translation_shots: int = 5
     article_max_words: int = 400
-    max_prompt_tokens: int | None = None  # None = model max positions - max_new_tokens
     # --- detection --------------------------------------------------------------------
     min_detect_tokens: int = 50  # samples whose human text is shorter are excluded everywhere
     target_fprs: tuple[float, ...] = (0.01, 0.05)
@@ -69,17 +85,20 @@ class BenchmarkConfig:
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
 
-    # Fields that select *which* work is done or how it is reported, not how records are produced.
+    # Fields that select *which* work is done, how it is reported, or a device/dtype *preference*
+    # (the resolved device type and dtype are checked separately through manifest.json).
     # Array tasks with different --variants / --datasets must share one results directory.
     _HASH_EXCLUDED = ("run_name", "results_root", "target_fprs", "smoke", "oracle_model_name",
-                      "min_detect_tokens", "variants", "datasets", "n_samples", "run_robustness")
+                      "min_detect_tokens", "variants", "datasets", "n_samples", "run_robustness",
+                      "device", "dtype")
 
     def config_hash(self) -> str:
-        """Hash of everything that changes generated records (see ``_HASH_EXCLUDED``)."""
+        """Hash of everything that changes generated records, including the algorithm JSON files."""
         d = self.as_dict()
         for k in self._HASH_EXCLUDED:
             d.pop(k, None)
         d["sampling"] = SAMPLING
+        d["watermark_config_files"] = watermark_config_digest()
         return hashlib.sha1(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
     def with_updates(self, **kw) -> "BenchmarkConfig":
@@ -107,17 +126,22 @@ class BenchmarkConfig:
         return cls(**base)
 
     @classmethod
-    def from_env(cls, **kw) -> "BenchmarkConfig":
-        """Preset selected by ``WMBENCH_SMOKE_TEST``; scalar fields overridable via ``WMBENCH_*``.
+    def from_env(cls, preset: str | None = None, **kw) -> "BenchmarkConfig":
+        """Preset (explicit, else ``WMBENCH_SMOKE_TEST``) with ``WMBENCH_*`` overrides, then ``kw``.
 
         Recognised: WMBENCH_SMOKE_TEST (1/0), WMBENCH_MODEL, WMBENCH_ORACLE ("none" for None),
         WMBENCH_RUN_NAME, WMBENCH_VARIANTS (comma list), WMBENCH_DATASETS (comma list),
         WMBENCH_DEVICE, WMBENCH_DTYPE, WMBENCH_SEED, WMBENCH_RESULTS, WMBENCH_N_SAMPLES
         (JSON object or a single int applied to every dataset), WMBENCH_ROBUSTNESS (1/0).
-        Explicit ``kw`` win over the environment.
+        Explicit ``kw`` (and CLI flags, which the CLI applies afterwards) win over the environment.
         """
         env = os.environ
-        smoke = env.get("WMBENCH_SMOKE_TEST", "0").strip().lower() in ("1", "true", "yes")
+        if preset is None:
+            smoke = _truthy(env.get("WMBENCH_SMOKE_TEST", "0"))
+        elif preset in ("smoke", "full"):
+            smoke = preset == "smoke"
+        else:
+            raise ValueError(f"unknown preset {preset!r}")
         cfg = cls.smoke_test() if smoke else cls.full()
         upd: dict = {}
         if v := env.get("WMBENCH_MODEL"):
@@ -144,10 +168,14 @@ class BenchmarkConfig:
                 upd["n_samples"] = {**cfg.n_samples, **json.loads(v)}
             else:
                 upd["n_samples"] = {k: int(v) for k in cfg.n_samples}
-        if v := env.get("WMBENCH_ROBUSTNESS"):
-            upd["run_robustness"] = v.strip().lower() in ("1", "true", "yes")
+        if (v := env.get("WMBENCH_ROBUSTNESS")) is not None:
+            upd["run_robustness"] = _truthy(v)
         upd.update(kw)
         return cfg.with_updates(**upd)
+
+
+def _truthy(v: str) -> bool:
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_config_file(path: str | Path) -> BenchmarkConfig:

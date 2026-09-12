@@ -96,9 +96,13 @@ class PromptTemplates:
 
 
 def postprocess(kind: str, continuation: str) -> str:
-    """Trim a raw continuation to the task answer (first line for MT, first paragraph for summaries...)."""
-    text = continuation.strip()
+    """Trim a raw continuation to the task answer (first line for MT, first paragraph for summaries...).
+
+    Code completions keep their leading indentation (a base model continues the function body
+    directly after the docstring); only leading blank lines and fences are removed.
+    """
     if kind == "translation":
+        text = continuation.strip()
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         text = lines[0] if lines else ""
         # base-model few-shot prompts continue with another "German:" block
@@ -107,16 +111,17 @@ def postprocess(kind: str, continuation: str) -> str:
                 text = text.split(cue)[0].strip()
         return text
     if kind == "summarization":
-        paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+        paras = [p.strip() for p in continuation.strip().split("\n\n") if p.strip()]
         return paras[0] if paras else ""
     if kind == "code":
+        text = continuation
         if "```" in text:  # chat models wrap code in fences
             parts = text.split("```")
             text = parts[1] if len(parts) > 1 else parts[0]
             text = text[len("python"):] if text.startswith("python") else text
         from wmbench.metrics import clean_code_completion
 
-        return clean_code_completion(text).rstrip("\n")
+        return clean_code_completion(text).rstrip()
     return continuation
 
 
@@ -139,8 +144,9 @@ def load_task(name: str, n_samples: int, templates: PromptTemplates | None = Non
     """Load ``n_samples`` prompts for a task.
 
     By default the first ``n_samples`` rows are used (MarkLLM convention). With
-    ``shuffle_seed`` a seeded random subset is drawn instead. Few-shot demonstrations
-    for translation are taken from rows *after* the evaluated ones so they never overlap.
+    ``shuffle_seed`` a seeded random subset is drawn instead. Few-shot demonstrations for
+    translation are the *last* ``translation_shots`` rows of the (optionally shuffled) file,
+    reserved before the evaluated slice is taken, so prompts do not depend on ``n_samples``.
     """
     spec = TASKS[name]
     templates = templates or PromptTemplates()
@@ -151,7 +157,14 @@ def load_task(name: str, n_samples: int, templates: PromptTemplates | None = Non
     rows = _read_jsonl(path)
     if shuffle_seed is not None:
         random.Random(shuffle_seed).shuffle(rows)
-    chosen, rest = rows[:n_samples], rows[n_samples:]
+    shots: list[tuple[str, str]] = []
+    if spec.kind == "translation" and templates.translation_shots > 0:
+        k = templates.translation_shots
+        shots = [(r["de"], r["en"]) for r in rows[-k:]]
+        rows = rows[:-k]
+    if n_samples > len(rows):
+        raise ValueError(f"{name}: requested {n_samples} samples but only {len(rows)} are available")
+    chosen = rows[:n_samples]
     samples: list[Sample] = []
 
     if spec.kind == "completion":
@@ -159,14 +172,14 @@ def load_task(name: str, n_samples: int, templates: PromptTemplates | None = Non
             samples.append(Sample(f"c4-{i}", templates.completion(r["prompt"]), None, r["natural_text"],
                                   {"prefix": r["prompt"]}))
     elif spec.kind == "translation":
-        shots = [(r["de"], r["en"]) for r in rest[: templates.translation_shots]]
         for i, r in enumerate(chosen):
             samples.append(Sample(f"wmt16-{i}", templates.translation(r["de"], shots), r["en"], r["en"],
                                   {"source": r["de"]}))
     elif spec.kind == "summarization":
         for i, r in enumerate(chosen):
+            truncated = len(r["article"].split()) > templates.article_max_words
             samples.append(Sample(f"cnndm-{r.get('id', i)}", templates.summarization(r["article"]),
-                                  r["highlights"], r["highlights"]))
+                                  r["highlights"], r["highlights"], {"prompt_truncated": truncated}))
     elif spec.kind == "code":
         for r in chosen:
             prompt = r["prompt"]

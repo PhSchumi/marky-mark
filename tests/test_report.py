@@ -6,8 +6,10 @@ import random
 
 import pytest
 
+import pandas as pd
+
 from wmbench.config import BenchmarkConfig
-from wmbench.report import build_report, df_to_markdown, load_run
+from wmbench.report import build_report, detection_table, df_to_markdown, fpr_col, load_run, quality_table
 
 
 def _write(path, rows):
@@ -91,6 +93,49 @@ def test_build_report_end_to_end(synthetic_run):
     assert "SMOKE TEST" in (cfg.run_dir / "summary.md").read_text()
     frames = load_run(cfg.run_dir)
     assert len(frames["generations"]) == 3 * (30 + 10)
+
+    def _no_const(c):
+        raise ValueError(c)
+
+    json.loads((cfg.run_dir / "results.json").read_text(), parse_constant=_no_const)  # no bare NaN tokens
+
+
+def test_report_survives_all_error_quality_rows_and_missing_quality(synthetic_run):
+    cfg = synthetic_run
+    _write(cfg.run_dir / "quality" / "wmt16_de_en" / "KGW.jsonl",
+           [{"sample_id": f"wmt16-{i}", "dataset": "wmt16_de_en", "variant": "KGW", "error": "boom"} for i in range(10)])
+    out = build_report(cfg, plots=True)
+    q = out["quality"]
+    row = q[(q.dataset == "wmt16_de_en") & (q.variant == "KGW")].iloc[0]
+    assert row.n_err_quality == 10 and "bleu_corpus" not in row.dropna()
+    # detection rows but no c4 quality rows at all -> plots must not abort the report
+    import shutil
+
+    shutil.rmtree(cfg.run_dir / "quality" / "c4")
+    out = build_report(cfg, plots=True)
+    assert (cfg.run_dir / "summary.md").exists() and "auroc_vs_human" in out["main"].columns
+
+
+def test_fpr_column_naming_and_all_targets(synthetic_run):
+    cfg = synthetic_run.with_updates(target_fprs=(0.001, 0.02, 0.05))
+    frames = load_run(cfg.run_dir)
+    dt = detection_table(frames["detection"], cfg, frames["generations"])
+    assert fpr_col(0.001, "human") == "tpr@0.1%fpr_human"
+    for col in ("tpr@0.1%fpr_human", "tpr@2%fpr_human", "tpr@5%fpr_human", "tpr@0.1%fpr_human_ci"):
+        assert col in dt.columns
+
+
+def test_latest_prefers_usable_row(synthetic_run):
+    cfg = synthetic_run
+    path = cfg.run_dir / "generations" / "wmt16_de_en" / "KGW.jsonl"
+    with open(path, "a") as f:  # a stale trailing error row must not hide the good generation
+        f.write(json.dumps({"sample_id": "wmt16-0", "dataset": "wmt16_de_en", "variant": "KGW", "error": "late boom"}) + "\n")
+    frames = load_run(cfg.run_dir)
+    g = frames["generations"]
+    r = g[(g.variant == "KGW") & (g.sample_id == "wmt16-0") & (g.dataset == "wmt16_de_en")].iloc[0]
+    assert r.error is None or pd.isna(r.error)
+    out = build_report(cfg, plots=False)
+    assert out["quality"][(out["quality"].dataset == "wmt16_de_en") & (out["quality"].variant == "KGW")].iloc[0].n_bleu == 10
 
 
 def test_df_to_markdown_handles_nan_and_empty():

@@ -28,4 +28,4 @@ RUN="${RUN:-$(basename "$MODEL")}"
 
 python scripts/run_benchmark.py --preset full \
   --model "$MODEL" --oracle "$ORACLE" --run-name "$RUN" \
-  --stage detect_none,quality,report --no-progress "$@"
+  --stage detect_none,quality,report --results-root "$WMBENCH_RESULTS" --no-progress "$@"

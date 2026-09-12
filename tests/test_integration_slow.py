@@ -86,3 +86,45 @@ def test_smoke_pipeline(tmp_path):
     r2.stage_generate()
     gens = r2.run_dir / "generations" / "c4" / "KGW.jsonl"
     assert len(gens.read_text().strip().splitlines()) == 3
+
+
+def test_chat_template_single_bos_in_ppl_and_semstamp(tiny):
+    """With a chat template that emits BOS, PPL context and SemStamp ids must match PromptFormatter.encode."""
+    from wmbench import metrics
+    from wmbench.models import PromptFormatter
+
+    model, tok, _ = tiny
+    tok.chat_template = "{{ bos_token }}{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}<assistant>"
+    try:
+        fmt = PromptFormatter(tok, use_chat_template=True)
+        ids = fmt.encode("hello")
+        text = fmt.format("hello")
+        assert ids.count(tok.bos_token_id) == 1
+        assert list(tok(text, add_special_tokens=False)["input_ids"]) == ids
+        nll_a, n_a = metrics.continuation_nll(model, tok, text, " world", "cpu", prompt_add_special_tokens=False)
+        nll_b, n_b = metrics.continuation_nll(model, tok, text, " world", "cpu", prompt_add_special_tokens=True)
+        assert n_a == n_b and nll_a != nll_b  # the double BOS changes the context
+    finally:
+        tok.chat_template = None
+
+
+def test_semstamp_uses_shared_prompt_ids_and_budget(tiny):
+    from wmbench.watermarks import build_variant
+
+    model, tok, fmt = tiny
+    v = build_variant("SemStamp", model, tok, "cpu", 24, semstamp_n_max=2)
+    ids = fmt.encode("The history of the Roman Empire is a long one.")
+    seen = {}
+    orig = model.generate
+
+    def spy(input_ids, *a, **kw):
+        seen.setdefault("first", input_ids[0].tolist())
+        return orig(input_ids, *a, **kw)
+
+    model.generate = spy
+    try:
+        out = v.generate(ids, "The history of the Roman Empire is a long one.")
+    finally:
+        model.generate = orig
+    assert seen["first"] == ids
+    assert len(out.continuation_ids) <= 24

@@ -132,25 +132,38 @@ works; chat/instruct models are detected from the tokenizer's chat template and 
 Sampling is fixed to plain multinomial sampling (`temperature=1, top_p=1, top_k=0`) for **every** variant:
 it is the only setting under which KGW/SIR (bias before tempering), MorphMark/SynthID (return log-probs of a
 reweighted distribution) and PF (its own decoder) sample from the same base distribution.
-The cell honours `WMBENCH_*` environment variables so the notebook can be executed headlessly without edits.
+The cell starts from `BenchmarkConfig.from_env()`, so every `WMBENCH_*` variable documented there
+(`WMBENCH_SMOKE_TEST`, `WMBENCH_MODEL`, `WMBENCH_ORACLE`, `WMBENCH_RUN_NAME`, `WMBENCH_VARIANTS`, `WMBENCH_DATASETS`,
+`WMBENCH_DEVICE`, `WMBENCH_DTYPE`, `WMBENCH_SEED`, `WMBENCH_RESULTS`, `WMBENCH_N_SAMPLES`, `WMBENCH_ROBUSTNESS`) works for
+headless execution; the constants in the cell override the environment when set.
 """)
 code("""
-SMOKE_TEST   = os.environ.get("WMBENCH_SMOKE_TEST", "1") == "1"   # <-- set to False for the real run
-MODEL_NAME   = os.environ.get("WMBENCH_MODEL", "facebook/opt-1.3b")   # <-- PLACEHOLDER: your Hugging Face model
-ORACLE_MODEL = os.environ.get("WMBENCH_ORACLE", "facebook/opt-2.7b")  # PPL oracle; "none" -> score with MODEL_NAME
-RUN_NAME     = os.environ.get("WMBENCH_RUN_NAME", "smoke" if SMOKE_TEST else "nb-" + MODEL_NAME.split("/")[-1])
-VARIANTS_TO_RUN = ("none", "KGW", "MorphMark", "PF", "SynthID", "SIR")   # add "SemStamp" (slow, C4 only)
-DATASETS_TO_RUN = ("c4", "wmt16_de_en", "cnn_dailymail")                 # add "humaneval" (executes model code)
-RUN_ROBUSTNESS  = os.environ.get("WMBENCH_ROBUSTNESS", "0") == "1"     # word-deletion attack on C4
-WATERMARK_OVERRIDES = {}   # e.g. {"KGW": {"delta": 1.5, "gamma": 0.25}} - keys as in configs/watermarks/*.json
+# Notebook overrides. Leave a value at None to take it from the WMBENCH_* environment (see
+# BenchmarkConfig.from_env) or the preset default; set it here to pin it for interactive use.
+SMOKE_TEST      = None      # None -> WMBENCH_SMOKE_TEST env (default: smoke); False for the real run
+MODEL_NAME      = None      # <-- PLACEHOLDER lives in BenchmarkConfig: "facebook/opt-1.3b"; e.g. "Qwen/Qwen2.5-1.5B-Instruct"
+ORACLE_MODEL    = None      # PPL oracle; "none" -> score with the generator
+RUN_NAME        = None
+VARIANTS_TO_RUN = None      # e.g. ("none", "KGW", "MorphMark", "PF", "SynthID", "SIR", "SemStamp")
+DATASETS_TO_RUN = None      # e.g. ("c4", "wmt16_de_en", "cnn_dailymail", "humaneval")
+RUN_ROBUSTNESS  = None      # True -> word-deletion attack on C4
+WATERMARK_OVERRIDES = {}    # e.g. {"KGW": {"delta": 1.5, "gamma": 0.25}} - keys as in configs/watermarks/*.json
 
-preset = BenchmarkConfig.smoke_test if SMOKE_TEST else BenchmarkConfig.full
-cfg = preset(run_name=RUN_NAME, variants=VARIANTS_TO_RUN, datasets=DATASETS_TO_RUN,
-             run_robustness=RUN_ROBUSTNESS, watermark_overrides=WATERMARK_OVERRIDES,
-             **({} if SMOKE_TEST else {"model_name": MODEL_NAME,
-                                       "oracle_model_name": None if ORACLE_MODEL.lower() == "none" else ORACLE_MODEL}))
+if SMOKE_TEST is not None:
+    os.environ["WMBENCH_SMOKE_TEST"] = "1" if SMOKE_TEST else "0"
+os.environ.setdefault("WMBENCH_SMOKE_TEST", "1")   # the notebook defaults to the smoke preset
+overrides = {k: v for k, v in {
+    "model_name": MODEL_NAME, "variants": VARIANTS_TO_RUN, "datasets": DATASETS_TO_RUN,
+    "run_robustness": RUN_ROBUSTNESS, "run_name": RUN_NAME}.items() if v is not None}
+if ORACLE_MODEL is not None:
+    overrides["oracle_model_name"] = None if str(ORACLE_MODEL).lower() == "none" else ORACLE_MODEL
+cfg = BenchmarkConfig.from_env(watermark_overrides=WATERMARK_OVERRIDES, **overrides)
+if RUN_NAME is None and not os.environ.get("WMBENCH_RUN_NAME"):
+    cfg = cfg.with_updates(run_name="smoke" if cfg.smoke else "nb-" + cfg.model_name.split("/")[-1])
+SMOKE_TEST = cfg.smoke
 if SMOKE_TEST:
-    display(Markdown("> **SMOKE TEST mode** - tiny model and a handful of samples; numbers are not meaningful."))
+    display(Markdown("> **SMOKE TEST mode** - tiny model and a handful of samples; numbers are not meaningful. "
+                     "Set `SMOKE_TEST = False` (or `WMBENCH_SMOKE_TEST=0`) for the real run."))
 print(json.dumps(cfg.as_dict(), indent=2))
 print("config hash:", cfg.config_hash(), "| results ->", cfg.run_dir)
 """, tags=["parameters"])
@@ -228,7 +241,7 @@ def demo(name, max_new_tokens=None):
         d = v.detect(text)
         print(f"  {label:13s} score={d.score:8.3f}  flagged={d.is_watermarked}  tokens={d.n_tokens}"
               + (f"  ({d.error})" if d.error else ""))
-    return v, out
+    return out
 """)
 
 md("""
@@ -299,8 +312,9 @@ SemStamp generates one sentence at a time, embeds it (SBERT), hashes the embeddi
 `2^dimension_d = 8` buckets, and only accepts the sentence if its bucket is in the `gamma=25%` "valid" set seeded by the
 previous sentence (otherwise it re-samples, up to `N_max` times). Detection counts valid sentences and reports a z-score.
 It is robust to paraphrasing but costs many generations per sentence and only measures on C4 here. MarkLLM's
-implementation is OPT-only and hard-codes temperature 0.7; wmbench lifts both restrictions. Enable it by adding
-`"SemStamp"` to `VARIANTS_TO_RUN`.
+implementation is OPT-only, hard-codes temperature 0.7 and suppresses EOS; wmbench uses the shared prompt ids and
+sampling settings, keeps EOS, bounds the continuation by the shared token budget and accepts the last candidate after
+`N_max` rejections. Enable it by adding `"SemStamp"` to `VARIANTS_TO_RUN`.
 """)
 code("""
 if "SemStamp" in cfg.variants:
@@ -341,7 +355,12 @@ md("""
 * **BLEU** (sacreBLEU, corpus level) on WMT16 de->en, **ROUGE-1/2/L** on CNN/DailyMail, **pass@1** on HumanEval if enabled
   (model code is executed in a subprocess with a timeout).
 """)
-code("""runner.stage_quality()""")
+code("""
+# Drop every notebook reference to the generator so it can really be freed before the oracle is loaded.
+for _name in ("model", "tok", "baseline", "_"):
+    globals().pop(_name, None)
+runner.stage_quality()
+""")
 
 # --------------------------------------------------------------------------- results
 md("""

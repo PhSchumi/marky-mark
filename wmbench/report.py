@@ -13,9 +13,17 @@ import pandas as pd
 from wmbench import metrics
 from wmbench.config import DETECTION_DATASETS, BenchmarkConfig
 from wmbench.data import TASKS
+from wmbench.generation import is_final_error
 from wmbench.watermarks import VARIANTS
 
 log = logging.getLogger("wmbench.report")
+
+QUALITY_COLUMNS = {
+    "completion": ("nll_sum", "n_tokens", "ppl", "rep_2", "rep_3", "rep_4", "diversity", "log_diversity_markllm", "oracle_model"),
+    "translation": ("bleu_sentence", "answer_words"),
+    "summarization": ("rouge1", "rouge2", "rougeL", "answer_words"),
+    "code": ("passed",),
+}
 
 
 # ----------------------------------------------------------------------------- loading
@@ -35,10 +43,19 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def _latest(rows: list[dict], keys=("sample_id",)) -> list[dict]:
-    out = {}
+    """Last row per key, preferring the last *usable* row (no error, or a final error) when one exists.
+
+    Mirrors ``generation.latest_by_sample(ok_only=True)``: a stale trailing error row must not
+    hide a good record that the resume logic itself treats as done.
+    """
+    best: dict[tuple, dict] = {}
     for r in rows:
-        out[tuple(r.get(k) for k in keys)] = r
-    return list(out.values())
+        k = tuple(r.get(x) for x in keys)
+        prev = best.get(k)
+        usable = not r.get("error") or is_final_error(r.get("error"))
+        if prev is None or usable or (prev.get("error") and not is_final_error(prev.get("error"))):
+            best[k] = r
+    return list(best.values())
 
 
 def load_run(run_dir: Path) -> dict[str, pd.DataFrame | dict]:
@@ -51,12 +68,15 @@ def load_run(run_dir: Path) -> dict[str, pd.DataFrame | dict]:
         rows = []
         for path in sorted((run_dir / kind).glob("*/*.jsonl")):
             rows.extend(_latest(_read_jsonl(path), keys))
-        frames[kind] = pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        if not df.empty and "error" not in df.columns:
+            df["error"] = None
+        frames[kind] = df
     frames["manifest"] = manifest
     return frames
 
 
-# ----------------------------------------------------------------------------- summaries
+# ----------------------------------------------------------------------------- helpers
 
 
 def _fmt(x, nd=3):
@@ -71,18 +91,40 @@ def _ci(lo, hi, nd=2):
     return "-" if not (math.isfinite(lo) and math.isfinite(hi)) else f"[{lo:.{nd}f}, {hi:.{nd}f}]"
 
 
+def fpr_col(fpr: float, tag: str) -> str:
+    """Column name for TPR at a target FPR: 0.01 -> ``tpr@1%fpr_<tag>``, 0.001 -> ``tpr@0.1%fpr_<tag>``."""
+    return f"tpr@{fpr * 100:g}%fpr_{tag}"
+
+
+def kept_sample_ids(det: pd.DataFrame, cfg: BenchmarkConfig) -> set:
+    """Common exclusion: samples whose human continuation is shorter than ``min_detect_tokens``."""
+    if det.empty or "text_kind" not in det:
+        return set()
+    human_len = det[det.text_kind == "human"].groupby("sample_id")["n_tokens"].min()
+    return set(human_len[human_len >= cfg.min_detect_tokens].index)
+
+
+def _records(df: pd.DataFrame) -> list[dict]:
+    """DataFrame rows as JSON-safe dicts (NaN/NaT -> null)."""
+    if df.empty:
+        return []
+    return json.loads(df.to_json(orient="records"))
+
+
+# ----------------------------------------------------------------------------- summaries
+
+
 def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame) -> pd.DataFrame:
     """Per variant: AUROC / TPR@FPR / best-F1 / fixed-threshold TPR+FPR against human and 'none' negatives."""
     rows = []
     if det.empty:
         return pd.DataFrame(rows)
+    primary = cfg.target_fprs[0]
     for dataset in DETECTION_DATASETS:
         d = det[det.dataset == dataset]
         if d.empty:
             continue
-        # common exclusion: samples whose human continuation is shorter than min_detect_tokens
-        human_len = d[d.text_kind == "human"].groupby("sample_id")["n_tokens"].min()
-        keep = set(human_len[human_len >= cfg.min_detect_tokens].index)
+        keep = kept_sample_ids(d, cfg)
         for variant in [v for v in cfg.variants if v != "none" and v in set(d.variant)]:
             dv = d[(d.variant == variant) & (d.sample_id.isin(keep))]
             pos = dv[dv.text_kind == "watermarked"]
@@ -90,28 +132,24 @@ def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame)
                    "n_samples_kept": len(keep), "n_pos": int(pos.score.notna().sum()),
                    "n_pos_nan": int(pos.score.isna().sum()), "pos_mean": float(pos.score.mean()),
                    "pos_tokens_mean": float(pos.n_tokens.mean()) if len(pos) else float("nan")}
-            for neg_kind, tag in (("human", "human"), ("unwatermarked", "none"), ("attacked", None)):
+            for neg_kind, tag in (("human", "human"), ("unwatermarked", "none")):
                 neg = dv[dv.text_kind == neg_kind]
-                if neg_kind == "attacked":
-                    continue
                 if neg.empty:
                     continue
                 s = metrics.detection_summary(pos.score, neg.score, pos.is_watermarked, neg.is_watermarked)
-                boot = metrics.detection_bootstrap(pos.score, neg.score, cfg.target_fprs[0], seed=cfg.seed)
-                row.update({
-                    f"n_neg_{tag}": s.n_neg, f"neg_mean_{tag}": s.neg_mean, f"auroc_{tag}": s.auroc,
-                    f"auroc_{tag}_ci": _ci(*boot["auroc"]),
-                    f"tpr@{int(cfg.target_fprs[0]*100)}%fpr_{tag}": metrics.tpr_at_fpr(pos.score, neg.score, cfg.target_fprs[0])[0],
-                    f"tpr@{int(cfg.target_fprs[0]*100)}%fpr_{tag}_ci": _ci(*boot["tpr_at_fpr"]),
-                    f"tpr@{int(cfg.target_fprs[-1]*100)}%fpr_{tag}": metrics.tpr_at_fpr(pos.score, neg.score, cfg.target_fprs[-1])[0],
-                    f"best_f1_{tag}": s.best_f1,
-                    f"fixed_thr_tpr_{tag}": s.fixed_threshold_tpr, f"fixed_thr_fpr_{tag}": s.fixed_threshold_fpr,
-                    f"fpr_warning_{tag}": s.n_neg < 1 / cfg.target_fprs[0],
-                })
+                boot = metrics.detection_bootstrap(pos.score, neg.score, primary, seed=cfg.seed)
+                row.update({f"n_neg_{tag}": s.n_neg, f"neg_mean_{tag}": s.neg_mean, f"auroc_{tag}": s.auroc,
+                            f"auroc_{tag}_ci": _ci(*boot["auroc"])})
+                for f in cfg.target_fprs:
+                    row[fpr_col(f, tag)] = metrics.tpr_at_fpr(pos.score, neg.score, f)[0]
+                row[fpr_col(primary, tag) + "_ci"] = _ci(*boot["tpr_at_fpr"])
+                row.update({f"best_f1_{tag}": s.best_f1,
+                            f"fixed_thr_tpr_{tag}": s.fixed_threshold_tpr, f"fixed_thr_fpr_{tag}": s.fixed_threshold_fpr,
+                            f"fpr_warning_{tag}": bool(s.n_neg < 1 / primary)})
             att = dv[dv.text_kind == "attacked"]
             hum = dv[dv.text_kind == "human"]
             if not att.empty and not hum.empty:
-                _, thr = metrics.tpr_at_fpr(pos.score, hum.score, cfg.target_fprs[0])
+                _, thr = metrics.tpr_at_fpr(pos.score, hum.score, primary)
                 a = metrics._clean(att.score)
                 row.update({
                     "attack": f"word_deletion({cfg.word_deletion_ratio})",
@@ -136,32 +174,41 @@ def quality_table(qual: pd.DataFrame, gens: pd.DataFrame, cfg: BenchmarkConfig) 
             if q.empty and g.empty:
                 continue
             row = {"dataset": dataset, "variant": variant,
-                   "n_ok": int((g.error.isna()).sum()) if not g.empty else int(q.error.isna().sum()),
-                   "n_err": int(g.error.notna().sum()) if not g.empty else 0}
+                   "n_ok": int(g.error.isna().sum()) if not g.empty else 0,
+                   "n_err": int(g.error.notna().sum()) if not g.empty else 0,
+                   "n_ok_quality": int(q.error.isna().sum()) if not q.empty else 0,
+                   "n_err_quality": int(q.error.notna().sum()) if not q.empty else 0}
             if not g.empty and variant != "human":
                 ok = g[g.error.isna()]
-                row.update(cont_tokens_mean=float(ok.continuation_tokens.mean()),
-                           gen_seconds_mean=float(ok.gen_seconds.mean()),
+                row.update(cont_tokens_mean=float(ok.continuation_tokens.mean()) if len(ok) else float("nan"),
+                           gen_seconds_mean=float(ok.gen_seconds.mean()) if len(ok) else float("nan"),
                            tokens_per_second=float(ok.continuation_tokens.sum() / ok.gen_seconds.sum())
-                           if ok.gen_seconds.sum() else float("nan"))
-            if q.empty:
+                           if len(ok) and ok.gen_seconds.sum() else float("nan"))
+            qok = q[q.error.isna()] if not q.empty else pd.DataFrame()
+            if qok.empty:
                 rows.append(row)
                 continue
-            qok = q[q.error.isna()]
+            qok = qok.reindex(columns=qok.columns.union(QUALITY_COLUMNS[task.kind]))
             if task.kind == "completion":
+                oracles = set(qok.oracle_model.dropna())
+                if len(oracles) > 1:
+                    log.warning("%s/%s: quality rows come from several oracles %s; re-run stage quality", dataset,
+                                variant, sorted(oracles))
                 row.update(ppl_corpus=metrics.corpus_perplexity(qok.nll_sum, qok.n_tokens),
                            ppl_median=float(qok.ppl.median()), ppl_mean=float(qok.ppl.mean()),
                            ppl_ci=_ci(*metrics.bootstrap_ci(qok.ppl, np.median, seed=cfg.seed)),
                            diversity=float(qok.diversity.mean()), rep_2=float(qok.rep_2.mean()),
                            log_diversity_markllm=float(qok.log_diversity_markllm.mean()),
-                           oracle=qok.oracle_model.iloc[0] if "oracle_model" in qok and len(qok) else None)
+                           oracle=" | ".join(sorted(oracles)) if oracles else None)
             elif task.kind == "translation":
-                hyp = gens[(gens.dataset == dataset) & (gens.variant == variant) & gens.error.isna()]
-                hyp = hyp.set_index("sample_id").loc[qok.sample_id]
-                row.update(bleu_corpus=metrics.corpus_bleu(list(hyp.answer), list(hyp.reference)),
+                hyp = g[g.error.isna()].set_index("sample_id") if not g.empty else pd.DataFrame()
+                ids = [s for s in qok.sample_id if s in hyp.index]
+                qb = qok.set_index("sample_id").loc[ids] if ids else qok.iloc[0:0]
+                row.update(bleu_corpus=metrics.corpus_bleu(list(hyp.loc[ids].answer), list(hyp.loc[ids].reference))
+                           if ids else float("nan"),
                            bleu_sentence_mean=float(qok.bleu_sentence.mean()),
                            bleu_sentence_ci=_ci(*metrics.bootstrap_ci(qok.bleu_sentence, seed=cfg.seed)),
-                           answer_words_mean=float(qok.answer_words.mean()))
+                           answer_words_mean=float(qok.answer_words.mean()), n_bleu=len(ids))
             elif task.kind == "summarization":
                 row.update(rouge1=float(qok.rouge1.mean()), rouge2=float(qok.rouge2.mean()),
                            rougeL=float(qok.rougeL.mean()),
@@ -179,10 +226,10 @@ def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
     rows = []
     if qual.empty:
         return pd.DataFrame(rows)
-    specs = {"c4": [("log_ppl", lambda q: np.log(q.ppl)), ("diversity", lambda q: q.diversity)],
-             "wmt16_de_en": [("bleu_sentence", lambda q: q.bleu_sentence)],
-             "cnn_dailymail": [("rougeL", lambda q: q.rougeL)],
-             "humaneval": [("pass", lambda q: q.passed.astype(float))]}
+    specs = {"c4": [("log_ppl", "ppl", np.log), ("diversity", "diversity", None)],
+             "wmt16_de_en": [("bleu_sentence", "bleu_sentence", None)],
+             "cnn_dailymail": [("rougeL", "rougeL", None)],
+             "humaneval": [("pass", "passed", None)]}
     for dataset, items in specs.items():
         base = qual[(qual.dataset == dataset) & (qual.variant == "none") & qual.error.isna()].set_index("sample_id")
         if base.empty:
@@ -192,8 +239,12 @@ def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
             common = base.index.intersection(q.index)
             if len(common) < 2:
                 continue
-            for metric, fn in items:
-                a, b = fn(q.loc[common]).astype(float), fn(base.loc[common]).astype(float)
+            for metric, col, fn in items:
+                if col not in q.columns or col not in base.columns:
+                    continue
+                a, b = q.loc[common, col].astype(float), base.loc[common, col].astype(float)
+                if fn is not None:
+                    a, b = fn(a), fn(b)
                 lo, hi = metrics.paired_bootstrap_ci(a, b, seed=cfg.seed)
                 rows.append({"dataset": dataset, "variant": variant, "metric": metric, "n_pairs": len(common),
                              "delta_vs_none": float(np.nanmean(a - b)), "ci_low": lo, "ci_high": hi})
@@ -203,6 +254,7 @@ def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
 def main_table(qt: pd.DataFrame, dt: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
     """One row per variant with the headline numbers from every track."""
     order = ["none"] + [v for v in cfg.variants if v != "none"] + ["human"]
+    primary = cfg.target_fprs[0]
     rows = []
     for variant in order:
         row = {"variant": variant}
@@ -226,9 +278,10 @@ def main_table(qt: pd.DataFrame, dt: pd.DataFrame, cfg: BenchmarkConfig) -> pd.D
             d = dt[dt.variant == variant]
             if not d.empty:
                 r = d.iloc[0]
-                fpr = int(cfg.target_fprs[0] * 100)
-                row.update({"auroc_vs_human": r.get("auroc_human"), f"tpr@{fpr}%fpr_vs_human": r.get(f"tpr@{fpr}%fpr_human"),
-                            "auroc_vs_none": r.get("auroc_none"), f"tpr@{fpr}%fpr_vs_none": r.get(f"tpr@{fpr}%fpr_none"),
+                row.update({"auroc_vs_human": r.get("auroc_human"),
+                            fpr_col(primary, "vs_human"): r.get(fpr_col(primary, "human")),
+                            "auroc_vs_none": r.get("auroc_none"),
+                            fpr_col(primary, "vs_none"): r.get(fpr_col(primary, "none")),
                             "fixed_thr_tpr": r.get("fixed_thr_tpr_human"), "fixed_thr_fpr": r.get("fixed_thr_fpr_human"),
                             "attacked_tpr": r.get("attacked_tpr_at_clean_thr")})
         if len(row) > 1:
@@ -259,61 +312,65 @@ def make_plots(frames: dict, cfg: BenchmarkConfig, out_dir: Path, dt: pd.DataFra
     paths = []
     det = frames["detection"]
     variants = [v for v in cfg.variants if v != "none"]
-    if not det.empty:
-        # score histograms per variant
-        n = len(variants)
-        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.2), squeeze=False)
-        for ax, variant in zip(axes[0], variants):
-            d = det[(det.dataset == DETECTION_DATASETS[0]) & (det.variant == variant)]
-            for kind, color in (("human", "tab:gray"), ("unwatermarked", "tab:blue"), ("watermarked", "tab:red"),
-                                ("attacked", "tab:orange")):
-                s = d[d.text_kind == kind].score.dropna()
-                if len(s):
-                    ax.hist(s, bins=20, alpha=0.5, label=kind, color=color)
-            thr = VARIANTS[variant].fixed_threshold
-            if thr is not None:
-                ax.axvline(thr, color="k", ls="--", lw=1, label="shipped threshold")
-            ax.set_title(f"{variant}: {VARIANTS[variant].score_name}", fontsize=9)
-            ax.legend(fontsize=7)
-        fig.tight_layout()
-        p = out_dir / "score_histograms.png"
-        fig.savefig(p, dpi=120)
-        plt.close(fig)
-        paths.append(p)
-        # ROC overlay vs human
-        from sklearn.metrics import roc_curve
+    primary = cfg.target_fprs[0]
+    if not det.empty and "dataset" in det:
+        d0 = det[det.dataset == DETECTION_DATASETS[0]]
+        keep = kept_sample_ids(d0, cfg)
+        d0 = d0[d0.sample_id.isin(keep)]
+        present = [v for v in variants if v in set(d0.variant)]
+        if present:
+            fig, axes = plt.subplots(1, len(present), figsize=(4 * len(present), 3.2), squeeze=False)
+            for ax, variant in zip(axes[0], present):
+                d = d0[d0.variant == variant]
+                for kind, color in (("human", "tab:gray"), ("unwatermarked", "tab:blue"), ("watermarked", "tab:red"),
+                                    ("attacked", "tab:orange")):
+                    s = d[d.text_kind == kind].score.dropna()
+                    if len(s):
+                        ax.hist(s, bins=20, alpha=0.5, label=kind, color=color)
+                thr = VARIANTS[variant].fixed_threshold
+                if thr is not None:
+                    ax.axvline(thr, color="k", ls="--", lw=1, label="shipped threshold")
+                ax.set_title(f"{variant}: {VARIANTS[variant].score_name} (n kept={len(keep)})", fontsize=8)
+                ax.legend(fontsize=7)
+            fig.tight_layout()
+            p = out_dir / "score_histograms.png"
+            fig.savefig(p, dpi=120)
+            plt.close(fig)
+            paths.append(p)
 
-        fig, ax = plt.subplots(figsize=(4.5, 4))
-        for variant in variants:
-            d = det[(det.dataset == DETECTION_DATASETS[0]) & (det.variant == variant)]
-            pos, neg = d[d.text_kind == "watermarked"].score.dropna(), d[d.text_kind == "human"].score.dropna()
-            if len(pos) and len(neg):
-                y = np.r_[np.ones(len(pos)), np.zeros(len(neg))]
-                fpr, tpr, _ = roc_curve(y, np.r_[pos, neg])
-                ax.plot(fpr, tpr, label=f"{variant} (AUC {metrics.auroc(pos, neg):.3f})")
-        ax.plot([0, 1], [0, 1], "k:", lw=0.8)
-        ax.set_xlabel("FPR (human text)")
-        ax.set_ylabel("TPR (watermarked)")
-        ax.set_xscale("symlog", linthresh=0.01)
-        ax.legend(fontsize=7)
-        fig.tight_layout()
-        p = out_dir / "roc_vs_human.png"
-        fig.savefig(p, dpi=120)
-        plt.close(fig)
-        paths.append(p)
-    if not qt.empty and not dt.empty:
+            from sklearn.metrics import roc_curve
+
+            fig, ax = plt.subplots(figsize=(4.5, 4))
+            for variant in present:
+                d = d0[d0.variant == variant]
+                pos, neg = d[d.text_kind == "watermarked"].score.dropna(), d[d.text_kind == "human"].score.dropna()
+                if len(pos) and len(neg):
+                    y = np.r_[np.ones(len(pos)), np.zeros(len(neg))]
+                    fpr, tpr, _ = roc_curve(y, np.r_[pos, neg])
+                    ax.plot(fpr, tpr, label=f"{variant} (AUC {metrics.auroc(pos, neg):.3f})")
+            ax.plot([0, 1], [0, 1], "k:", lw=0.8)
+            ax.set_xlabel("FPR (human text)")
+            ax.set_ylabel("TPR (watermarked)")
+            ax.set_xscale("symlog", linthresh=0.01)
+            ax.legend(fontsize=7)
+            fig.tight_layout()
+            p = out_dir / "roc_vs_human.png"
+            fig.savefig(p, dpi=120)
+            plt.close(fig)
+            paths.append(p)
+    if not qt.empty and not dt.empty and "ppl_corpus" in qt.columns:
         c4 = qt[qt.dataset == "c4"].set_index("variant")
+        col = fpr_col(primary, "human")
         fig, ax = plt.subplots(figsize=(4.5, 3.5))
-        fpr = int(cfg.target_fprs[0] * 100)
         for _, r in dt.iterrows():
-            if r.variant in c4.index and f"tpr@{fpr}%fpr_human" in r:
-                ax.scatter(c4.loc[r.variant, "ppl_corpus"], r[f"tpr@{fpr}%fpr_human"])
-                ax.annotate(r.variant, (c4.loc[r.variant, "ppl_corpus"], r[f"tpr@{fpr}%fpr_human"]), fontsize=8)
-        if "none" in c4.index:
+            if r.variant in c4.index and col in r and pd.notna(c4.loc[r.variant, "ppl_corpus"]) and pd.notna(r[col]):
+                ax.scatter(c4.loc[r.variant, "ppl_corpus"], r[col])
+                ax.annotate(r.variant, (c4.loc[r.variant, "ppl_corpus"], r[col]), fontsize=8)
+        if "none" in c4.index and pd.notna(c4.loc["none", "ppl_corpus"]):
             ax.axvline(c4.loc["none", "ppl_corpus"], color="k", ls="--", lw=1, label="none (PPL)")
+            ax.legend(fontsize=7)
         ax.set_xlabel("corpus PPL (oracle)")
-        ax.set_ylabel(f"TPR @ {fpr}% FPR (vs human)")
-        ax.legend(fontsize=7)
+        ax.set_ylabel(f"TPR @ {primary * 100:g}% FPR (vs human)")
         fig.tight_layout()
         p = out_dir / "ppl_vs_tpr.png"
         fig.savefig(p, dpi=120)
@@ -323,7 +380,7 @@ def make_plots(frames: dict, cfg: BenchmarkConfig, out_dir: Path, dt: pd.DataFra
         bars = []
         for dataset, col in (("wmt16_de_en", "bleu_corpus"), ("cnn_dailymail", "rougeL"), ("humaneval", "pass_at_1")):
             t = qt[(qt.dataset == dataset) & (qt.variant != "human")]
-            if not t.empty and col in t:
+            if not t.empty and col in t and t[col].notna().any():
                 bars.append((f"{dataset}: {col}", t.set_index("variant")[col]))
         if bars:
             fig, axes = plt.subplots(1, len(bars), figsize=(4 * len(bars), 3.2), squeeze=False)
@@ -352,20 +409,26 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
     dt.to_csv(run_dir / "detection_summary.csv", index=False)
     qt.to_csv(run_dir / "quality_summary.csv", index=False)
     pdlt.to_csv(run_dir / "paired_deltas.csv", index=False)
-    plot_paths = make_plots(frames, cfg, run_dir / "plots", dt, qt) if plots else []
+    plot_paths: list[Path] = []
+    if plots:
+        try:
+            plot_paths = make_plots(frames, cfg, run_dir / "plots", dt, qt)
+        except Exception as exc:  # noqa: BLE001 - a plotting failure must not lose the tables
+            log.warning("plotting failed: %s", exc)
 
+    primary = cfg.target_fprs[0]
     md = [f"# wmbench results: `{cfg.run_name}`", ""]
     if cfg.smoke:
         md += ["> **SMOKE TEST** - tiny model, a handful of samples, short generations. These numbers only",
                "> validate that the pipeline runs; they say nothing about the watermarks.", ""]
+    env = frames["manifest"].get("environment", {})
     md += [f"Model: `{cfg.model_name}` | oracle: `{cfg.oracle_model_name or cfg.model_name}` | "
-           f"device: {frames['manifest'].get('environment', {}).get('device_type')} | "
+           f"device: {env.get('device_type')} ({env.get('dtype')}) | "
            f"MarkLLM: `{frames['manifest'].get('markllm_commit', '')[:8]}` | config hash: `{cfg.config_hash()}`", ""]
     md += ["## Main table", "", df_to_markdown(mt), ""]
-    fpr = int(cfg.target_fprs[0] * 100)
     md += [f"Detection columns use C4 continuations; negatives are human continuations (`vs_human`) or the `none` "
            f"variant's generations (`vs_none`). `fixed_thr_*` use each algorithm's shipped threshold. "
-           f"`tpr@{fpr}%fpr` is unreliable when fewer than {int(1 / cfg.target_fprs[0])} negatives are available "
+           f"`tpr@{primary * 100:g}%fpr` is unreliable when fewer than {int(1 / primary)} negatives are available "
            f"(see `fpr_warning_*` in detection_summary.csv).", ""]
     md += ["## Detection", "", df_to_markdown(dt), "", "## Quality per dataset", "", df_to_markdown(qt), "",
            "## Paired differences vs `none` (same prompts, bootstrap 95% CI)", "", df_to_markdown(pdlt), ""]
@@ -373,8 +436,7 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
         md += ["## Plots", ""] + [f"![{p.stem}](plots/{p.name})" for p in plot_paths] + [""]
     (run_dir / "summary.md").write_text("\n".join(md))
     (run_dir / "results.json").write_text(json.dumps({
-        "main": mt.to_dict(orient="records"), "detection": dt.to_dict(orient="records"),
-        "quality": qt.to_dict(orient="records"), "paired_deltas": pdlt.to_dict(orient="records")},
-        indent=2, default=lambda o: None if isinstance(o, float) and not math.isfinite(o) else str(o)))
+        "main": _records(mt), "detection": _records(dt), "quality": _records(qt), "paired_deltas": _records(pdlt)},
+        indent=2, allow_nan=False))
     log.info("report written to %s", run_dir / "summary.md")
     return {"main": mt, "detection": dt, "quality": qt, "paired_deltas": pdlt, "plots": plot_paths, "frames": frames}

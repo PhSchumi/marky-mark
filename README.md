@@ -103,10 +103,12 @@ MODEL=facebook/opt-1.3b ORACLE=facebook/opt-2.7b RUN=opt13b sbatch --dependency=
 ```
 
 Every stage is resumable: re-submitting continues from the cached JSONL records. A results directory
-belongs to one *data-producing* configuration (model, seed, generation lengths, prompt settings, watermark
-hyperparameters; hashed into `manifest.json`); which variants, datasets or sample counts a job runs, and the
-reporting knobs, may differ between jobs that share it. A mismatch is refused unless `--force-new-run`.
-Results land in
+belongs to one *data-producing* configuration (model, seed, generation lengths, prompt settings, the
+contents of `configs/watermarks/*.json` and any overrides; hashed into `manifest.json`); which variants,
+datasets or sample counts a job runs, the device preference, and the reporting knobs may differ between
+jobs that share it. A mismatch is refused unless `--force-new-run`. Cached records additionally carry the
+effective hyperparameters and the prompt hash of the variant that produced them, so editing a JSON file
+regenerates exactly the affected records. Results land in
 `results/<run-name>/` (`summary.md`, `summary.csv`, `detection_summary.csv`, `quality_summary.csv`,
 `paired_deltas.csv`, `plots/`, per-sample `generations/`, `detection/`, `quality/`, `manifest.json`, `logs/`).
 
@@ -122,7 +124,10 @@ jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1 \
   --output executed.ipynb notebooks/watermark_benchmark.ipynb
 ```
 
-(`scripts/slurm/notebook.sbatch` does exactly this.) The notebook is generated from
+(`scripts/slurm/notebook.sbatch` does exactly this.) With a virtualenv, register it as a kernel once
+(`python -m ipykernel install --user --name wmbench`) and add `--ExecutePreprocessor.kernel_name=wmbench`;
+if a user-level Jupyter config pulls in extensions that are not installed in the venv, point
+`JUPYTER_CONFIG_DIR` at an empty directory for the run. The notebook is generated from
 `scripts/build_notebook.py`; edit that file and rebuild rather than editing cells by hand.
 
 ## Pipeline and stages
@@ -132,11 +137,13 @@ jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1 \
 | `generate` | for each (dataset, variant): format prompt, generate with a per-sample seed, time it, cache; on C4 also score own continuations, human continuations, optionally attacked continuations | yes: `--variants X` per array task |
 | `detect_none` | each watermark detector scores the `none` generations (harder negatives) | needs `none` |
 | `quality` | PPL with the oracle (generator freed first), diversity, BLEU, ROUGE, pass@1 | needs generations |
-| `report` | pure pandas over the JSONL files | any node |
+| `report` | pure pandas over the JSONL files | any node (same device type as the run, see below) |
 
 Detection on CPU and CUDA is **not** interchangeable: MarkLLM seeds `torch.Generator(device=...)` and the
-two streams differ, so the runner refuses to score records generated on another device type unless
-`--allow-device-mismatch` is passed (fine for smoke tests, wrong for results).
+two streams differ, so the runner refuses to touch a results directory produced on another device type
+or dtype unless `--allow-device-mismatch` is passed (fine for smoke tests, wrong for results). Environment
+variables (`WMBENCH_*`, see `BenchmarkConfig.from_env`) are applied on top of `--preset`; explicit flags win;
+`--config <file>` is a frozen snapshot that ignores both.
 
 ## Metrics
 
@@ -176,16 +183,23 @@ comparison.
   * SIR's token mapping is vocabulary-size specific; MarkLLM would silently create an unseeded random one for
     unknown vocabularies. A seeded mapping is generated and persisted instead, and the CUDA-pinned
     checkpoint is re-saved for CPU hosts.
-  * SemStamp is OPT-only and hard-codes temperature 0.7 and a repetition penalty in MarkLLM; the subclass
-    uses the shared settings and accepts the last candidate after `N_max` rejections (the paper's fallback).
+  * SemStamp is OPT-only, hard-codes temperature 0.7 and a repetition penalty and suppresses EOS in MarkLLM;
+    the subclass uses the shared prompt ids and sampling settings, keeps EOS, bounds the continuation by the
+    shared token budget and accepts the last candidate after `N_max` rejections (the paper's fallback).
   * `min_new_tokens` and `no_repeat_ngram_size` from MarkLLM's examples are not used: PF ignores them.
+  * The model's hub `generation_config.json` (repetition penalties, extra EOS ids, ...) is discarded except
+    for the token ids when the model is loaded, and the resulting stop set is shared by every variant; the
+    discarded fields are logged. Otherwise the HF-generate variants would inherit hub defaults that PF's own
+    decoder never sees.
 
 ## Adding a model or a variant
 
-* **Model**: any `AutoModelForCausalLM`. Pass `--model`; choose an oracle larger than it (`--oracle`) or
-  `--oracle none`. `vocab_size` given to MarkLLM is the logit dimension (`wmbench.models.logits_vocab_size`).
-  Chat models are prompted through their chat template; base models get few-shot / cue prompts
-  (`wmbench/data.py`).
+* **Model**: any `AutoModelForCausalLM` (Hub id or local path). Pass `--model`; choose an oracle larger than
+  it (`--oracle`) or `--oracle none`. `vocab_size` given to MarkLLM is the logit dimension
+  (`wmbench.models.logits_vocab_size`). Chat models are prompted through their chat template (prefetch the
+  template file with `prepare_assets.py` on offline clusters; the manifest records whether one was used);
+  base models get few-shot / cue prompts (`wmbench/data.py`). With a foreign-family oracle the chat markup is
+  scored as literal context.
 * **Hyperparameters**: edit `configs/watermarks/<name>.json` or pass overrides
   (`BenchmarkConfig(watermark_overrides={"KGW": {"delta": 1.0}})`; JSON config via `--config`).
 * **Variant**: add a `VariantSpec` to `wmbench/watermarks.py` (MarkLLM algorithm key, config file, score
@@ -206,6 +220,9 @@ pytest -m slow         # integration: every variant on facebook/opt-125m, SynthI
 * Log-likelihood benchmarks (MMLU-style multiple choice) are invariant to decoding-time watermarks and are
   therefore not included; generation benchmarks (translation, summarisation, code) are.
 * `TPR@1%FPR` needs at least 100 negatives; the full preset uses 500 C4 prompts.
+* Prompts that do not fit the model context with `max_new_tokens` are recorded as `ContextOverflow` errors
+  (never silently truncated); CNN/DailyMail articles are cut to `article_max_words` before templating and
+  the record's `prompt_truncated` flag says so.
 * SemStamp is slow (up to `N_max` generations per sentence) and only evaluated on C4.
 * MarkLLM is Apache-2.0; the small subclasses in `wmbench/watermarks.py` derive from it.
 

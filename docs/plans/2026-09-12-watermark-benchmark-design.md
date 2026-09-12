@@ -208,3 +208,20 @@ Not adopted: a GSM8K exact-match track (unconfirmed need; near-zero for the plac
 attacks, multiple generation seeds per prompt, batched generation (PF and SemStamp cannot batch), vendoring
 MarkLLM, YAML as a third configuration surface, a non-1 shared temperature, and a lock file from a cluster run
 (cannot be produced locally; generate `pip freeze > requirements-lock.txt` after the first successful cluster run).
+
+## 10. Code review outcomes (2026-09-12, five-dimension review, three skeptics per finding)
+
+31 findings, 30 confirmed by majority vote, all implemented:
+
+| area | change |
+|---|---|
+| fairness | hub `generation_config` neutralised at load (token ids only, dropped fields logged); one stop-id set shared by HF-generate variants and the PF decoder; resolved generation config recorded in `effective_config()` |
+| SemStamp | consumes the shared prompt ids, natural EOS (`min_new_tokens=0`), per-call remaining budget, stops on EOS, continuation capped at `max_new_tokens` |
+| chat models | prompt text already carrying BOS is tokenised with `add_special_tokens=False` for oracle PPL; `*.jinja` chat templates prefetched; chat-template use recorded in the manifest |
+| reproducibility | `configs/watermarks/*.json` digests are part of the run hash; cached records are reused only with matching `variant_config_hash` and `prompt_sha1`; translation demonstrations come from a reserved tail block independent of `n_samples`; quality rows are keyed by oracle; device/dtype *preferences* left out of the hash, resolved dtype checked via the manifest |
+| robustness | manifest written via `mkstemp` + `os.replace` under an advisory lock (SLURM arrays); OOM retry outside the except handler; `ContextOverflow` errors are final (no retry, no failure streak); HumanEval runner inherits the environment, distinguishes interpreter failures, and the canonical solution is checked once per run |
+| correctness | `postprocess("code")` keeps indentation; `results.json` never contains bare `NaN`; report survives all-error quality rows, missing quality columns, stale trailing error rows; plots use the same min-length filter as the tables; TPR columns named `tpr@<x>%fpr_*` for every `target_fprs` entry; quality-stage errors reported |
+| ergonomics | `from_env(preset=...)` composes presets with `WMBENCH_*`; SLURM scripts pass `--results-root`; tokenizer loads without the model for quality-only jobs; `free_generator` warns when notebook variables still hold the model; notebook config cell is env-driven and releases model references before the quality stage; `prepare_assets` accepts local model paths; dead `max_prompt_tokens` removed |
+
+Rejected by the skeptics: the headless-notebook kernel finding (already fixed during the review by
+registering a kernel and passing `--ExecutePreprocessor.kernel_name`).

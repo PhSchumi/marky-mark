@@ -24,7 +24,13 @@ export WMBENCH_MODEL="${WMBENCH_MODEL:-facebook/opt-1.3b}"
 export WMBENCH_ORACLE="${WMBENCH_ORACLE:-facebook/opt-2.7b}"
 export WMBENCH_RUN_NAME="${WMBENCH_RUN_NAME:-nb-$(basename "$WMBENCH_MODEL")}"
 
+# KERNEL: name of the Jupyter kernel that has this repo's dependencies (python -m ipykernel install --user --name wmbench)
+KERNEL="${KERNEL:-wmbench}"
+export JUPYTER_CONFIG_DIR="${JUPYTER_CONFIG_DIR:-$PWD/results/.jupyter}"   # isolate from user-level nbconvert extensions
+mkdir -p "$JUPYTER_CONFIG_DIR"
+
 jupyter nbconvert --to notebook --execute \
   --ExecutePreprocessor.timeout=-1 \
+  --ExecutePreprocessor.kernel_name="$KERNEL" \
   --output "executed_${WMBENCH_RUN_NAME}.ipynb" \
   notebooks/watermark_benchmark.ipynb

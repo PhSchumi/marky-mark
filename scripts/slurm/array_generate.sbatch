@@ -8,8 +8,8 @@
 #SBATCH --output=slurm-%A_%a.out
 #
 # Job A: one array task per variant runs stage "generate" (generation + self-detection on
-# its own and the human texts). Tasks write only to their own <variant>.jsonl files, so they
-# never race. Submit job B (merge.sbatch) with --dependency=afterok:<this job id>.
+# its own and the human texts). Tasks write only to their own <variant>.jsonl files; the shared
+# manifest.json is updated under a lock. Submit job B (merge.sbatch) with --dependency=afterok:<job id>.
 #
 # Usage:
 #   JOBA=$(MODEL=facebook/opt-1.3b RUN=opt13b sbatch --parsable scripts/slurm/array_generate.sbatch)
@@ -35,4 +35,4 @@ VARIANT="${VARIANTS[$SLURM_ARRAY_TASK_ID]}"
 echo "task $SLURM_ARRAY_TASK_ID -> variant $VARIANT"
 python scripts/run_benchmark.py --preset full \
   --model "$MODEL" --run-name "$RUN" \
-  --stage generate --variants "$VARIANT" --no-progress "$@"
+  --stage generate --variants "$VARIANT" --results-root "$WMBENCH_RESULTS" --no-progress "$@"

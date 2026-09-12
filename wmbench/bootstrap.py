@@ -190,7 +190,11 @@ def prefetch_models(model_names: list[str]) -> None:
     from huggingface_hub import snapshot_download
 
     for name in model_names:
-        if name:
-            log.info("prefetching %s", name)
-            snapshot_download(name, allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors", "*.bin",
-                                                    "*.tiktoken", "*.py"])
+        if not name:
+            continue
+        if Path(name).is_dir():
+            log.info("%s is a local path, nothing to prefetch", name)
+            continue
+        log.info("prefetching %s", name)
+        snapshot_download(name, allow_patterns=["*.json", "*.txt", "*.model", "*.safetensors", "*.bin",
+                                                "*.tiktoken", "*.py", "*.jinja"])  # *.jinja: chat templates

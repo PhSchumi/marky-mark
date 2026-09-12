@@ -23,19 +23,17 @@ import torch
 from transformers import LogitsProcessorList
 
 from wmbench.bootstrap import (
-    REPO_ROOT,
     default_artifacts_dir,
     ensure_markllm,
     ensure_nltk,
     ensure_sir_assets,
     sir_mapping_path,
 )
-from wmbench.config import SAMPLING
-from wmbench.models import extract_continuation, logits_vocab_size, max_positions
+from wmbench.config import CONFIG_DIR, SAMPLING
+from wmbench.models import extract_continuation, logits_vocab_size, max_positions, stop_token_ids
 
 log = logging.getLogger("wmbench.watermarks")
 
-CONFIG_DIR = REPO_ROOT / "configs" / "watermarks"
 
 
 def _one_sided_normal_tail(z: float) -> float:
@@ -145,6 +143,7 @@ class WatermarkVariant:
         self.vocab_size = logits_vocab_size(model)
         self.max_positions = max_positions(model)
         self.gen_kwargs = dict(SAMPLING, max_new_tokens=max_new_tokens, pad_token_id=tokenizer.pad_token_id)
+        self.stop_ids = stop_token_ids(model, tokenizer)  # every EOS id of the model + tokenizer eos/pad
         self.wm = None
         self._processor = None
         if spec.algorithm:
@@ -162,6 +161,9 @@ class WatermarkVariant:
     def effective_config(self) -> dict:
         cfg = dict(getattr(getattr(self.wm, "config", None), "config_dict", {}) or {})
         cfg["sampling"] = dict(SAMPLING, max_new_tokens=self.max_new_tokens)
+        gc = self.model.generation_config.to_diff_dict()
+        gc.pop("transformers_version", None)
+        cfg["generation_config"] = gc
         return cfg
 
     def _build(self) -> None:
@@ -197,17 +199,18 @@ class WatermarkVariant:
             overrides["max_seq_len"] = self.max_positions
         elif alg == "SEMSTAMP":
             ensure_nltk()
-            overrides.update(max_new_tokens=self.max_new_tokens, min_new_tokens=self.max_new_tokens,
-                             N_max=self.semstamp_n_max)
+            overrides.update(max_new_tokens=self.max_new_tokens, min_new_tokens=0, N_max=self.semstamp_n_max)
 
         if alg == "PF":
             from watermark.pf import PFConfig
 
             self.wm = _PFWithIds(PFConfig(str(cfg_path), tc, **overrides))
+            self.wm.utils.stop_ids = self.stop_ids
         elif alg == "SEMSTAMP":
             from watermark.semstamp import SemStampConfig
 
             self.wm = _SemStampGeneral(SemStampConfig(str(cfg_path), tc, **overrides))
+            self.wm.utils.stop_ids = self.stop_ids
         else:
             self.wm = AutoWatermark.load(alg, algorithm_config=str(cfg_path), transformers_config=tc, **overrides)
             self._processor = self.wm.logits_processor
@@ -222,8 +225,7 @@ class WatermarkVariant:
             kwargs["logits_processor"] = LogitsProcessorList([processor])
         out = self.model.generate(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), **kwargs)
         ids = out[0, input_ids.shape[1]:].tolist()
-        stop = {t for t in (self.tokenizer.eos_token_id, self.tokenizer.pad_token_id) if t is not None}
-        while ids and ids[-1] in stop:
+        while ids and ids[-1] in self.stop_ids:
             ids.pop()
         return ids
 
@@ -246,13 +248,16 @@ class WatermarkVariant:
         elif alg == "SEMSTAMP":
             text = prompt_text if prompt_text is not None else self._decode(prompt_ids)
             with contextlib.redirect_stdout(io.StringIO()) as buf:
-                full = self.wm.generate_watermarked_text(text)
+                full = self.wm.generate_watermarked_text(text, prompt_ids=prompt_ids)
             for line in buf.getvalue().splitlines():
                 if line.startswith("WARNING"):
                     log.debug("SemStamp: %s", line)
             cont = extract_continuation(full, text)
-            ids = self.tokenizer(cont, add_special_tokens=False)["input_ids"]
-            return GenerationOutput(list(ids), cont, text)
+            ids = list(self.tokenizer(cont, add_special_tokens=False)["input_ids"])
+            if len(ids) > self.max_new_tokens:  # sentence granularity can overshoot; enforce the shared budget
+                ids = ids[: self.max_new_tokens]
+                cont = self._decode(ids)
+            return GenerationOutput(ids, cont, text)
         else:  # KGW, MorphMark, SIR: plain HF generate with the algorithm's logits processor
             ids = self._hf_generate(prompt_ids, self._processor)
         return GenerationOutput(ids, self._decode(ids), prompt_text)
@@ -349,7 +354,8 @@ def _pf_generate_from_ids(self, prompt_ids: list[int]) -> list[int]:
     * consumes the shared prompt ids (BOS handled like every other variant) instead of
       re-encoding the prompt with ``add_special_tokens=False``;
     * casts the last-step logits to fp32 before Permute-and-Flip sampling;
-    * stops at EOS instead of filling the buffer and truncating afterwards;
+    * stops at any of the model's EOS ids (same stop set as the HF-generate variants) instead of
+      filling the buffer and truncating at the tokenizer's single EOS afterwards;
     * returns continuation ids only (no special tokens leak into the decoded text).
     """
     cfg = self.config
@@ -361,6 +367,7 @@ def _pf_generate_from_ids(self, prompt_ids: list[int]) -> list[int]:
     temperature = float(cfg.gen_kwargs.get("temperature", 1.0))
     top_p = float(cfg.gen_kwargs.get("top_p", 1.0))
     dev = model.device
+    stop_ids = getattr(self.utils, "stop_ids", None) or {self.utils.eos_id}
     tokens = torch.full((total_len,), self.utils.pad_id, dtype=torch.long, device=dev)
     tokens[: len(prompt_ids)] = torch.tensor(prompt_ids, dtype=torch.long, device=dev)
     past, prev_pos, end = None, 0, len(prompt_ids)
@@ -371,7 +378,7 @@ def _pf_generate_from_ids(self, prompt_ids: list[int]) -> list[int]:
         logits = outputs.logits[:, -1, :].float()
         next_tok = self.utils.sample_next(logits, ngram_tokens, temperature, top_p)
         tok = int(next_tok.reshape(-1)[0].item())
-        if tok == self.utils.eos_id:
+        if tok in stop_ids:
             break
         tokens[cur_pos] = tok
         end = cur_pos + 1
@@ -379,14 +386,16 @@ def _pf_generate_from_ids(self, prompt_ids: list[int]) -> list[int]:
     return tokens[len(prompt_ids):end].tolist()
 
 
-def _semstamp_generate(self, prompt: str, *args, **kwargs) -> str:  # noqa: C901 - upstream loop
+def _semstamp_generate(self, prompt: str, *args, prompt_ids: list[int] | None = None, **kwargs) -> str:  # noqa: C901
     """MarkLLM SemStamp loop without the OPT-only check and with the shared sampling settings.
 
-    ``watermark/semstamp/semstamp.py`` with three changes: ``model.generate`` gets
-    ``config.gen_kwargs`` (plus ``min_new_tokens`` so EOS cannot cut a sentence short; the
-    sentence-end stopping criterion controls length) instead of hard-coded OPT settings;
-    any model works; after ``N_max`` rejected candidates the last candidate is accepted
-    (the paper's fallback; MarkLLM's loop never accepts an invalid sentence).
+    ``watermark/semstamp/semstamp.py`` with these changes: the shared prompt ids are used when
+    given (identical BOS handling to the other variants); ``model.generate`` gets
+    ``config.gen_kwargs`` instead of hard-coded OPT settings, EOS keeps its natural probability
+    (``min_new_tokens=0``) and generation stops when a sentence ends on EOS; each call is bounded
+    by the *remaining* token budget so the continuation never exceeds ``max_new_tokens``; any
+    model works; after ``N_max`` rejected candidates the last candidate is accepted (the paper's
+    fallback; MarkLLM's loop never accepts an invalid sentence).
     """
     import torch.nn.functional as F
     from transformers import StoppingCriteriaList
@@ -396,8 +405,8 @@ def _semstamp_generate(self, prompt: str, *args, **kwargs) -> str:  # noqa: C901
     lsh_model = utils.get_lsh_model()
     sent_end_criteria = utils.SentenceEndCriteria(cfg.generation_tokenizer)
     gen_kwargs = dict(cfg.gen_kwargs)
-    gen_kwargs["max_new_tokens"] = cfg.max_new_tokens
-    gen_kwargs["min_new_tokens"] = cfg.min_new_tokens
+    gen_kwargs["min_new_tokens"] = 0
+    stop_ids = getattr(utils, "stop_ids", None) or {cfg.generation_tokenizer.eos_token_id}
 
     lsh_seed = lsh_model.get_hash([prompt])[0]
     n_bins = 2 ** cfg.dimension_d
@@ -406,14 +415,22 @@ def _semstamp_generate(self, prompt: str, *args, **kwargs) -> str:  # noqa: C901
     accept_mask = torch.randperm(n_bins, device=cfg.device, generator=utils.rng)[:n_accept]
 
     text = prompt
-    text_ids = cfg.generation_tokenizer.encode(prompt, return_tensors="pt").to(cfg.device)
+    if prompt_ids is not None:
+        text_ids = torch.tensor([list(prompt_ids)], dtype=torch.long, device=cfg.device)
+    else:  # standalone use: same single-BOS behaviour as the other variants for base models
+        text_ids = cfg.generation_tokenizer.encode(prompt, return_tensors="pt", add_special_tokens=True).to(cfg.device)
     prompt_length = text_ids.shape[1]
     sent_end_criteria.update(text)
     current_trials = 0
     while True:
+        remaining = cfg.max_new_tokens - (text_ids.shape[1] - prompt_length)
+        if remaining <= 0:
+            break
+        gen_kwargs["max_new_tokens"] = int(remaining)
         outputs = cfg.generation_model.generate(
             text_ids, stopping_criteria=StoppingCriteriaList([sent_end_criteria]), **gen_kwargs)
-        new_text_ids = outputs[:, :-1]
+        ended_on_eos = int(outputs[0, -1].item()) in stop_ids
+        new_text_ids = outputs[:, :-1]  # drop the token that started the next sentence (or the EOS)
         new_text = cfg.generation_tokenizer.decode(new_text_ids[0, text_ids.size(1):], skip_special_tokens=True)
         if new_text == "":
             break
@@ -435,6 +452,6 @@ def _semstamp_generate(self, prompt: str, *args, **kwargs) -> str:  # noqa: C901
         text += new_text
         text_ids = new_text_ids.to(cfg.device)
         sent_end_criteria.update(text)
-        if text_ids.shape[1] - prompt_length >= cfg.max_new_tokens - 1:
+        if ended_on_eos or text_ids.shape[1] - prompt_length >= cfg.max_new_tokens - 1:
             break
     return text

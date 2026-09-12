@@ -19,8 +19,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Benchmark MarkLLM watermarks (KGW, MorphMark, PF, SynthID, SIR, SemStamp) on one HF model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--preset", choices=["full", "smoke"], default=None,
-                   help="start from a preset (default: WMBENCH_SMOKE_TEST env decides, else full)")
-    p.add_argument("--config", type=Path, help="JSON/YAML file with BenchmarkConfig fields (overrides preset)")
+                   help="start from a preset (default: WMBENCH_SMOKE_TEST env decides, else full); "
+                        "WMBENCH_* environment overrides are applied on top, explicit flags win")
+    p.add_argument("--config", type=Path, help="JSON/YAML file with BenchmarkConfig fields (frozen snapshot; "
+                                                "replaces preset and environment)")
     p.add_argument("--stage", default="all", help=f"comma list of stages from {STAGES} or 'all'")
     p.add_argument("--model", help="Hugging Face model id or path for the generator")
     p.add_argument("--oracle", help="PPL oracle model id; 'none' scores with the generator")
@@ -53,14 +55,10 @@ def _int_or_json(value: str, base: dict) -> dict:
 
 
 def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
-    if args.config:
+    if args.config:  # a config file is a frozen snapshot: no environment overrides
         cfg = load_config_file(args.config)
-    elif args.preset == "smoke":
-        cfg = BenchmarkConfig.smoke_test()
-    elif args.preset == "full":
-        cfg = BenchmarkConfig.full()
-    else:
-        cfg = BenchmarkConfig.from_env()
+    else:  # preset (explicit or WMBENCH_SMOKE_TEST) + WMBENCH_* overrides; CLI flags win below
+        cfg = BenchmarkConfig.from_env(preset=args.preset)
     upd: dict = {}
     if args.model:
         upd["model_name"] = args.model

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from wmbench.watermarks import WatermarkVariant
 log = logging.getLogger("wmbench.generation")
 
 MAX_CONSECUTIVE_ERRORS = 5
+CONTEXT_OVERFLOW = "ContextOverflow"  # error class that is final: never retried, never counted as a failure streak
 
 
 # ----------------------------------------------------------------------------- storage
@@ -59,7 +61,7 @@ class JsonlStore:
 
     def rewrite(self, records: Iterable[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_suffix(f".{os.getpid()}.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             for r in records:
                 f.write(json.dumps(r, ensure_ascii=False, default=_default) + "\n")
@@ -76,17 +78,25 @@ def _default(o):
     raise TypeError(f"not JSON serialisable: {type(o)}")
 
 
+def is_final_error(err: str | None) -> bool:
+    return bool(err) and err.startswith(CONTEXT_OVERFLOW)
+
+
 def latest_by_sample(rows: list[dict], *, ok_only: bool = False) -> dict[str, dict]:
-    """Last record per sample id (later rows supersede earlier ones, e.g. retried errors)."""
+    """Last record per sample id (later rows supersede earlier ones, e.g. retried errors).
+
+    With ``ok_only`` a record counts as done if it has no error or a *final* error
+    (context overflow), so such samples are neither retried nor re-counted as failures.
+    """
     out: dict[str, dict] = {}
     for r in rows:
-        if ok_only and r.get("error"):
+        if ok_only and r.get("error") and not is_final_error(r.get("error")):
             continue
         out[r["sample_id"]] = r
     return out
 
 
-# ----------------------------------------------------------------------------- seeding
+# ----------------------------------------------------------------------------- seeding / hashing
 
 
 def stable_seed(*parts) -> int:
@@ -100,6 +110,19 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+_MACHINE_SPECIFIC_KEYS = ("transform_model_name", "embedding_model_path", "mapping_name", "path_to_embedder")
+
+
+def variant_config_digest(variant: WatermarkVariant) -> str:
+    """Hash of the variant's effective hyperparameters, minus machine-specific asset paths."""
+    cfg = {k: v for k, v in variant.effective_config().items() if k not in _MACHINE_SPECIFIC_KEYS}
+    return hashlib.sha1(json.dumps(cfg, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def prompt_sha1(prompt_text: str) -> str:
+    return hashlib.sha1(prompt_text.encode()).hexdigest()[:12]
 
 
 def environment_info(device: str, dtype: torch.dtype) -> dict:
@@ -129,46 +152,73 @@ def generate_records(variant: WatermarkVariant, samples: list[Sample], formatter
                      resume: bool = True) -> list[dict]:
     """Generate (or load cached) records for one (variant, dataset).
 
-    Records with an ``error`` are retried on resume. Aborts after
-    :data:`MAX_CONSECUTIVE_ERRORS` consecutive failures or on any CUDA runtime error
-    other than an out-of-memory that a single retry resolves.
+    A cached record is reused only if it has no (non-final) error, was produced with the same
+    effective watermark hyperparameters (``variant_config_hash``) and the same prompt text
+    (``prompt_sha1``); anything else is regenerated with a warning. Aborts after
+    :data:`MAX_CONSECUTIVE_ERRORS` consecutive failures or on any CUDA runtime error other
+    than an out-of-memory that a single retry resolves.
     """
     store = JsonlStore(generation_path(cfg.run_dir, task.name, variant.name))
-    existing = latest_by_sample(store.read(), ok_only=True) if resume else {}
+    vhash = variant_config_digest(variant)
+    prompts = {s.id: (formatter.format(s.task_prompt), formatter.encode(s.task_prompt)) for s in samples}
+
+    existing: dict[str, dict] = {}
+    stale_hash = stale_prompt = 0
+    if resume:
+        for sid, r in latest_by_sample(store.read(), ok_only=True).items():
+            if sid not in prompts:
+                continue
+            if r.get("variant_config_hash") != vhash:
+                stale_hash += 1
+                continue
+            if r.get("prompt_sha1") != prompt_sha1(prompts[sid][0]):
+                stale_prompt += 1
+                continue
+            existing[sid] = r
+    if stale_hash or stale_prompt:
+        log.warning("%s/%s: ignoring %d cached records with other watermark hyperparameters and %d with a "
+                    "different prompt; they will be regenerated", task.name, variant.name, stale_hash, stale_prompt)
     todo = [s for s in samples if s.id not in existing]
     log.info("%s/%s: %d cached, %d to generate", task.name, variant.name, len(existing), len(todo))
-    variant_config_hash = hashlib.sha1(json.dumps(variant.effective_config(), sort_keys=True,
-                                                  default=str).encode()).hexdigest()[:12]
 
     if todo:  # untimed warm-up so lazy initialisation does not land in the first timing
         try:
-            variant.generate(formatter.encode(todo[0].task_prompt), formatter.format(todo[0].task_prompt))
+            variant.generate(prompts[todo[0].id][1], prompts[todo[0].id][0])
         except Exception as exc:  # noqa: BLE001
             log.warning("warm-up generation failed for %s: %s", variant.name, exc)
 
+    index_of = {s.id: i for i, s in enumerate(samples)}
     consecutive_errors = 0
     iterator = tqdm(todo, desc=f"{task.name}/{variant.name}", disable=not show_progress or not _is_tty())
     for sample in iterator:
-        prompt_text = formatter.format(sample.task_prompt)
-        prompt_ids = formatter.encode(sample.task_prompt)
+        prompt_text, prompt_ids = prompts[sample.id]
         rec = {
             "schema_version": SCHEMA_VERSION, "run_name": cfg.run_name, "dataset": task.name,
-            "variant": variant.name, "variant_config_hash": variant_config_hash,
-            "sample_id": sample.id, "index": samples.index(sample),
+            "variant": variant.name, "variant_config_hash": vhash,
+            "sample_id": sample.id, "index": index_of[sample.id],
             "seed": stable_seed(cfg.seed, task.name, sample.id, variant.name),
-            "prompt": sample.task_prompt, "prompt_text": prompt_text,
-            "prompt_sha1": hashlib.sha1(prompt_text.encode()).hexdigest()[:12],
+            "prompt": sample.task_prompt, "prompt_text": prompt_text, "prompt_sha1": prompt_sha1(prompt_text),
             "prompt_tokens": len(prompt_ids), "prompt_truncated": bool(sample.meta.get("prompt_truncated", False)),
             "reference": sample.reference, "human_text": sample.human_text,
             "continuation": None, "answer": None, "continuation_tokens": None,
             "gen_seconds": None, "tokens_per_second": None, "error": None, **env,
         }
+        if len(prompt_ids) + variant.max_new_tokens > variant.max_positions:
+            rec["error"] = (f"{CONTEXT_OVERFLOW}: prompt {len(prompt_ids)} + max_new_tokens {variant.max_new_tokens} "
+                            f"> context {variant.max_positions}")
+            log.error("%s/%s sample %s: %s", task.name, variant.name, sample.id, rec["error"])
+            store.write(rec)
+            continue
         try:
             seed_everything(rec["seed"])
             t0 = time.perf_counter()
+            oom = False
             try:
                 out = variant.generate(prompt_ids, prompt_text)
             except torch.cuda.OutOfMemoryError:
+                oom = True
+            if oom:  # retry outside the handler so the failed call's tensors can actually be freed
+                gc.collect()
                 torch.cuda.empty_cache()
                 log.warning("CUDA OOM on %s; retrying once", sample.id)
                 seed_everything(rec["seed"])

@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase
 
 log = logging.getLogger("wmbench.models")
 
@@ -38,19 +38,63 @@ def _from_pretrained_dtype_kwarg(dtype: torch.dtype) -> dict:
     return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
 
 
-def load_causal_lm(name: str, device: str, dtype: torch.dtype, *, trust_remote_code: bool = False,
-                   tokenizer_name: str | None = None) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
-    """Load a causal LM and tokenizer onto ``device`` in eval mode.
-
-    The tokenizer gets a pad token (eos) if it has none; MarkLLM's PF decoder needs it.
-    """
-    tok = AutoTokenizer.from_pretrained(tokenizer_name or name, trust_remote_code=trust_remote_code)
+def load_tokenizer(name: str, *, trust_remote_code: bool = False) -> PreTrainedTokenizerBase:
+    """Tokenizer with a pad token (eos) if it has none; MarkLLM's PF decoder needs one."""
+    tok = AutoTokenizer.from_pretrained(name, trust_remote_code=trust_remote_code)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
+    return tok
+
+
+_GENERATION_CONFIG_KEEP = {"bos_token_id", "eos_token_id", "pad_token_id", "transformers_version", "_from_model_config"}
+
+
+def neutralize_generation_config(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> dict:
+    """Replace the hub ``generation_config`` by token ids only; return the discarded fields.
+
+    Hub checkpoints ship defaults such as ``repetition_penalty`` or ``no_repeat_ngram_size`` that
+    ``model.generate`` applies silently. The HF-generate variants would inherit them while PF's own
+    decoding loop would not, breaking the "one base distribution" contract, so everything except the
+    token ids is dropped (and logged).
+    """
+    old = model.generation_config
+    eos = old.eos_token_id
+    eos_ids = [eos] if isinstance(eos, int) else list(eos or [])
+    if tokenizer.eos_token_id is not None and tokenizer.eos_token_id not in eos_ids:
+        eos_ids.append(tokenizer.eos_token_id)
+    dropped = {k: v for k, v in old.to_diff_dict().items() if k not in _GENERATION_CONFIG_KEEP}
+    model.generation_config = GenerationConfig(
+        bos_token_id=old.bos_token_id if old.bos_token_id is not None else tokenizer.bos_token_id,
+        eos_token_id=eos_ids or None, pad_token_id=tokenizer.pad_token_id)
+    if dropped:
+        log.warning("discarded hub generation_config fields %s so that every variant samples from the same base "
+                    "distribution", dropped)
+    return dropped
+
+
+def stop_token_ids(model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase) -> set[int]:
+    """All ids that end a generation (every EOS id of the model plus the tokenizer's EOS/pad)."""
+    eos = model.generation_config.eos_token_id
+    ids = set([eos] if isinstance(eos, int) else list(eos or []))
+    for t in (tokenizer.eos_token_id, tokenizer.pad_token_id):
+        if t is not None:
+            ids.add(int(t))
+    return ids
+
+
+def load_causal_lm(name: str, device: str, dtype: torch.dtype, *, trust_remote_code: bool = False,
+                   tokenizer_name: str | None = None,
+                   tokenizer: PreTrainedTokenizerBase | None = None) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Load a causal LM (and tokenizer unless given) onto ``device`` in eval mode.
+
+    The hub generation config is neutralised (see :func:`neutralize_generation_config`).
+    """
+    tok = tokenizer or load_tokenizer(tokenizer_name or name, trust_remote_code=trust_remote_code)
     model = AutoModelForCausalLM.from_pretrained(
         name, trust_remote_code=trust_remote_code, **_from_pretrained_dtype_kwarg(dtype)
     )
     model = model.to(device).eval()
+    neutralize_generation_config(model, tok)
     log.info("loaded %s on %s (%s), %.1fM params", name, device, dtype,
              sum(p.numel() for p in model.parameters()) / 1e6)
     return model, tok

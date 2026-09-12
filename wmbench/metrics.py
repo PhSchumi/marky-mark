@@ -23,16 +23,18 @@ import torch
 
 @torch.no_grad()
 def continuation_nll(model, tokenizer, prompt: str, continuation: str, device: str,
-                     max_length: int = 2048) -> tuple[float, int]:
+                     max_length: int = 2048, *, prompt_add_special_tokens: bool = True) -> tuple[float, int]:
     """Summed negative log-likelihood of ``continuation`` given ``prompt`` and the token count.
 
     Prompt and continuation are tokenized separately and concatenated, so the loss
     is taken exactly over the continuation tokens (the KGW paper convention; MarkLLM's
     ``PPLCalculator`` instead scores the continuation without any context). The prompt
-    is left-truncated if the sequence exceeds ``max_length``. Returns ``(nan, 0)`` for an
-    empty continuation.
+    is left-truncated if the sequence exceeds ``max_length``. Pass
+    ``prompt_add_special_tokens=False`` when ``prompt`` is chat-template text that already
+    contains its special tokens (otherwise a second BOS would be prepended). Returns
+    ``(nan, 0)`` for an empty continuation.
     """
-    p_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+    p_ids = tokenizer(prompt, add_special_tokens=prompt_add_special_tokens)["input_ids"]
     c_ids = tokenizer(continuation, add_special_tokens=False)["input_ids"]
     if len(c_ids) == 0:
         return float("nan"), 0
@@ -48,9 +50,9 @@ def continuation_nll(model, tokenizer, prompt: str, continuation: str, device: s
 
 
 def conditional_perplexity(model, tokenizer, prompt: str, continuation: str, device: str,
-                           max_length: int = 2048) -> tuple[float, int]:
+                           max_length: int = 2048, **kw) -> tuple[float, int]:
     """``exp(mean NLL)`` of the continuation given the prompt; see :func:`continuation_nll`."""
-    nll, n = continuation_nll(model, tokenizer, prompt, continuation, device, max_length)
+    nll, n = continuation_nll(model, tokenizer, prompt, continuation, device, max_length, **kw)
     return (math.exp(nll / n) if n else float("nan")), n
 
 
@@ -154,9 +156,13 @@ def humaneval_passes(prompt: str, completion: str, test: str, entry_point: str, 
         try:
             proc = subprocess.run([sys.executable, "-c", _HUMANEVAL_RUNNER], input=program, text=True,
                                   capture_output=True, timeout=timeout, cwd=tmp,
-                                  env={"PATH": os.environ.get("PATH", ""), "PYTHONHASHSEED": "0"})
+                                  env={**os.environ, "PYTHONHASHSEED": "0"})
         except subprocess.TimeoutExpired:
             return False
+    # The runner swallows the program's own stderr, so any text on the real stderr means the
+    # interpreter itself failed to start (broken venv, loader error): that is not a failed test.
+    if proc.returncode != 0 and proc.stderr.strip():
+        raise RuntimeError(f"HumanEval runner failed to start: {proc.stderr.strip()[-300:]}")
     return proc.returncode == 0
 
 

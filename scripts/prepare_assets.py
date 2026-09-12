@@ -33,6 +33,8 @@ from wmbench import bootstrap  # noqa: E402
 
 
 def _revision(repo_id: str) -> str | None:
+    if Path(repo_id).is_dir():
+        return None  # local checkpoint
     try:
         from huggingface_hub import model_info
 
@@ -43,7 +45,7 @@ def _revision(repo_id: str) -> str | None:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="facebook/opt-1.3b", help="generator model id")
+    p.add_argument("--model", default="facebook/opt-1.3b", help="generator model id or local path")
     p.add_argument("--oracle", default="facebook/opt-2.7b", help="PPL oracle id ('none' to skip)")
     p.add_argument("--semstamp", action="store_true", help="also fetch the SemStamp sentence embedder")
     p.add_argument("--skip-models", action="store_true", help="only MarkLLM, SIR assets and NLTK data")
