@@ -11,7 +11,11 @@ Examples::
 
     # SLURM array: one (variant) per task, then a merge job (see scripts/slurm/)
     python scripts/run_benchmark.py --stage generate --variants KGW --run-name opt13b
-    python scripts/run_benchmark.py --stage detect_none,quality,report --run-name opt13b
+    python scripts/run_benchmark.py --stage detect,quality,report --run-name opt13b
+
+    # robustness track: attack (DIPPER needs a 40 GB+ GPU; prepare_assets.py --dipper first), then detect
+    python scripts/run_benchmark.py --stage attack --robustness --run-name opt13b
+    python scripts/run_benchmark.py --stage detect,report --robustness --run-name opt13b
 """
 
 import sys

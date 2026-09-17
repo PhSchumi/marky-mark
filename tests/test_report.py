@@ -12,6 +12,9 @@ from wmbench.config import BenchmarkConfig
 from wmbench.report import build_report, detection_table, df_to_markdown, fpr_col, load_run, quality_table
 
 
+SHORT_SAMPLES = (5, 6)  # detection budget below min_detect_tokens=5 -> excluded from every detection number
+
+
 def _write(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
@@ -54,12 +57,22 @@ def synthetic_run(tmp_path):
             for i in range(n):
                 if i == 3:
                     continue
-                for kind, mu in (("watermarked", 5.0), ("human", 0.0), ("unwatermarked", 0.2), ("attacked", 3.0)):
+                t = 3 if i in SHORT_SAMPLES else 40  # common detection budget of the sample (all kinds share it)
+                for kind, mu in (("watermarked", 5.0), ("human", 0.0), ("unwatermarked", 0.2),
+                                 ("attacked:word_deletion", 3.0), ("attacked:dipper", 1.5)):
+                    attacked = kind.startswith("attacked:")
                     det.append({"sample_id": f"c4-{i}", "dataset": "c4", "variant": variant, "text_kind": kind,
-                                "score": rng.gauss(mu, 1.0), "is_watermarked": mu > 2, "n_tokens": 40,
-                                "error": None, "raw": {}})
+                                "score": rng.gauss(mu, 1.0), "is_watermarked": mu > 2, "detect_tokens": t,
+                                "n_tokens": t - 1 if attacked else t, "error": None, "raw": {},
+                                "attack_config_hash": "ah" if attacked else None})
             det[0]["score"] = float("nan")  # one detector failure
             _write(run / "detection" / "c4" / f"{variant}.jsonl", det)
+            for attack, sim in (("word_deletion", None), ("dipper", 0.8)):
+                _write(run / "attacks" / "c4" / attack / f"{variant}.jsonl",
+                       [{"sample_id": f"c4-{i}", "dataset": "c4", "variant": variant, "attack": attack,
+                         "attack_config_hash": "ah", "detect_tokens": 3 if i in SHORT_SAMPLES else 40,
+                         "text": "x", "n_tokens": 39, "n_tokens_uncapped": 44, "len_ratio": 1.1,
+                         "bleu_vs_source": 25.0, "sim_embed": sim, "error": None} for i in range(n) if i != 3])
     _write(run / "quality" / "c4" / "human.jsonl",
            [{"sample_id": f"c4-{i}", "dataset": "c4", "variant": "human", "error": None, "nll_sum": 40 * math.log(8),
              "n_tokens": 40, "ppl": 8, "rep_2": 0.05, "rep_3": 0.01, "rep_4": 0.0, "diversity": 0.94,
@@ -79,9 +92,25 @@ def test_build_report_end_to_end(synthetic_run):
     assert main.loc["KGW", "tpr@1%fpr_vs_human"] > 0.5
     assert main.loc["none", "bleu"] == pytest.approx(100.0)
     assert main.loc["PF", "bleu"] < 100.0
-    assert 0 <= main.loc["KGW", "attacked_tpr"] <= 1
+    assert 0 <= main.loc["KGW", "attacked_tpr_word_deletion"] <= 1
+    assert main.loc["KGW", "attacked_tpr_dipper"] <= main.loc["KGW", "attacked_tpr_word_deletion"]
     det = out["detection"].set_index("variant")
-    assert det.loc["KGW", "n_pos"] == 28  # 29 kept minus one NaN
+    for attack in ("word_deletion", "dipper"):
+        assert det.loc["KGW", f"attacked_n_{attack}"] == 27
+        assert 0 <= det.loc["KGW", f"attacked_auroc_human_{attack}"] <= 1
+        assert 0 <= det.loc["KGW", f"attacked_fixed_thr_tpr_{attack}"] <= 1
+        assert det.loc["KGW", f"attacked_tokens_mean_{attack}"] == 39
+        assert det.loc["KGW", f"attack_len_ratio_{attack}"] == pytest.approx(1.1)
+        assert det.loc["KGW", f"attack_bleu_vs_source_{attack}"] == pytest.approx(25.0)
+    assert det.loc["KGW", "attack_sim_embed_dipper"] == pytest.approx(0.8)
+    assert pd.isna(det.loc["KGW", "attack_sim_embed_word_deletion"])
+    assert det.loc["KGW", "attacks"] == "word_deletion, dipper"
+    assert det.loc["KGW", "n_gen_ok"] == 29  # 30 generations minus the error row
+    assert det.loc["KGW", "n_samples_kept"] == 27  # minus the two samples below min_detect_tokens
+    assert det.loc["KGW", "n_pos"] == 26  # 27 kept minus one NaN
+    assert det.loc["KGW", "n_neg_human"] == 27 and det.loc["KGW", "n_neg_none"] == 27
+    assert det.loc["KGW", "detect_tokens_mean"] == 40
+    assert det.loc["KGW", "pos_tokens_mean"] == det.loc["KGW", "neg_tokens_mean_human"] == det.loc["KGW", "neg_tokens_mean_none"] == 40
     assert det.loc["KGW", "fpr_warning_human"]  # fewer than 100 negatives
     deltas = out["paired_deltas"]
     row = deltas[(deltas.variant == "PF") & (deltas.metric == "bleu_sentence")].iloc[0]
@@ -144,3 +173,83 @@ def test_df_to_markdown_handles_nan_and_empty():
     assert df_to_markdown(pd.DataFrame()) == "_(no rows)_"
     md = df_to_markdown(pd.DataFrame([{"a": float("nan"), "b": "x", "c": 1.23456}]))
     assert "| - | x | 1.235 |" in md
+
+
+def test_min_detect_tokens_filters_on_the_common_detection_budget(synthetic_run):
+    frames = load_run(synthetic_run.run_dir)
+    lenient = detection_table(frames["detection"], synthetic_run.with_updates(min_detect_tokens=3), frames["generations"])
+    strict = detection_table(frames["detection"], synthetic_run.with_updates(min_detect_tokens=41), frames["generations"])
+    assert set(lenient.set_index("variant").n_samples_kept) == {29}
+    assert strict.empty or set(strict.set_index("variant").n_samples_kept) == {0}
+
+
+def test_report_rejects_detection_rows_written_without_length_control(synthetic_run):
+    cfg = synthetic_run
+    path = cfg.run_dir / "detection" / "c4" / "PF.jsonl"
+    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    _write(path, [{k: v for k, v in r.items() if k != "detect_tokens"} for r in rows])
+    with pytest.raises(RuntimeError, match="detect_tokens"):
+        build_report(cfg, plots=False)
+
+
+def test_report_ignores_stray_legacy_rows_when_the_variant_was_rescored(synthetic_run, caplog):
+    """Legacy rows of samples that stage `detect` skipped must not block a re-scored run."""
+    cfg = synthetic_run
+    path = cfg.run_dir / "detection" / "c4" / "KGW.jsonl"
+    rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    legacy_ids = {"c4-10", "c4-11"}
+    _write(path, [{k: v for k, v in r.items() if k != "detect_tokens"} if r["sample_id"] in legacy_ids else r
+                  for r in rows])
+    with caplog.at_level("WARNING", logger="wmbench.report"):
+        out = build_report(cfg, plots=False)
+    det = out["detection"].set_index("variant")
+    assert det.loc["KGW", "n_samples_kept"] == 25  # 27 minus the two samples that only have legacy rows
+    assert det.loc["PF", "n_samples_kept"] == 27
+    assert any("before length control" in m for m in caplog.messages)
+
+
+def _det_rows(cfg, variant):
+    path = cfg.run_dir / "detection" / "c4" / f"{variant}.jsonl"
+    return path, [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def test_detection_uses_the_last_row_even_when_it_is_an_error(synthetic_run):
+    """A re-score at a smaller common budget that fails must supersede the stale good row."""
+    cfg = synthetic_run
+    path, rows = _det_rows(cfg, "KGW")
+    for kind in ("watermarked", "human", "unwatermarked", "attacked:word_deletion", "attacked:dipper"):
+        rows.append({"sample_id": "c4-0", "dataset": "c4", "variant": "KGW", "text_kind": kind, "detect_tokens": 3,
+                     "n_tokens": 3, "score": float("nan"), "is_watermarked": None, "error": "too short", "raw": {}})
+    _write(path, rows)
+    det = build_report(cfg, plots=False)["detection"].set_index("variant")
+    assert det.loc["KGW", "n_samples_kept"] == 26  # c4-0 now sits at T=3 < min_detect_tokens
+    assert det.loc["PF", "n_samples_kept"] == 27
+
+
+def test_negatives_must_share_the_budget_of_the_watermarked_row(synthetic_run, caplog):
+    """A negative scored at another length than the sample's watermarked text is dropped, not compared."""
+    cfg = synthetic_run
+    path, rows = _det_rows(cfg, "KGW")
+    for r in rows:
+        if r["sample_id"] == "c4-1" and r["text_kind"] == "human":
+            r["detect_tokens"] = r["n_tokens"] = 20
+    _write(path, rows)
+    with caplog.at_level("WARNING", logger="wmbench.report"):
+        det = build_report(cfg, plots=False)["detection"].set_index("variant")
+    assert det.loc["KGW", "n_samples_kept"] == 27
+    assert det.loc["KGW", "n_neg_human"] == 26 and det.loc["KGW", "n_neg_none"] == 27
+    assert any("budget" in m and "c4/KGW" in m for m in caplog.messages)
+
+
+def test_report_without_attack_rows_has_no_attack_columns(synthetic_run):
+    import shutil
+
+    cfg = synthetic_run
+    shutil.rmtree(cfg.run_dir / "attacks")
+    for variant in ("KGW", "PF"):
+        path = cfg.run_dir / "detection" / "c4" / f"{variant}.jsonl"
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        _write(path, [r for r in rows if not r["text_kind"].startswith("attacked:")])
+    out = build_report(cfg, plots=True)
+    assert not [c for c in out["detection"].columns if c.startswith("attack")]
+    assert not [c for c in out["main"].columns if c.startswith("attacked_tpr")]

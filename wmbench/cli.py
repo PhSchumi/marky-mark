@@ -35,7 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dtype", help="auto | float16 | bfloat16 | float32")
     p.add_argument("--seed", type=int)
     p.add_argument("--results-root", help="directory that holds results/<run-name>")
-    p.add_argument("--robustness", action="store_true", help="also score word-deletion-attacked texts")
+    p.add_argument("--robustness", action="store_true",
+                   help="run stage attack and score the attacked texts (see --attacks)")
+    p.add_argument("--attacks", help="comma list of attacks from wmbench.attacks.ATTACKS, e.g. word_deletion,dipper")
+    p.add_argument("--dipper-model", help="DIPPER paraphraser model id or path (default kalpeshk2011/dipper-paraphraser-xxl)")
     p.add_argument("--chat-template", choices=["auto", "on", "off"], default="auto")
     p.add_argument("--semstamp-n-max", type=int)
     p.add_argument("--no-resume", action="store_true", help="regenerate even if records exist")
@@ -84,6 +87,10 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         upd["results_root"] = args.results_root
     if args.robustness:
         upd["run_robustness"] = True
+    if args.attacks:
+        upd["attacks"] = tuple(v.strip() for v in args.attacks.split(",") if v.strip())
+    if args.dipper_model:
+        upd["dipper_model"] = args.dipper_model
     if args.chat_template != "auto":
         upd["use_chat_template"] = args.chat_template == "on"
     if args.semstamp_n_max is not None:

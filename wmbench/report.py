@@ -58,16 +58,31 @@ def _latest(rows: list[dict], keys=("sample_id",)) -> list[dict]:
     return list(best.values())
 
 
+def _last(rows: list[dict], keys=("sample_id", "text_kind")) -> list[dict]:
+    """Plain last row per key, for detection files.
+
+    Stage ``detect`` appends a row only when a (sample, kind) has to be (re-)scored, e.g. at a new
+    common budget, so the newest row is the truth even when it is an error: a stale good row may
+    sit at another length and must not mask it.
+    """
+    best: dict[tuple, dict] = {}
+    for r in rows:
+        best[tuple(r.get(x) for x in keys)] = r
+    return list(best.values())
+
+
 def load_run(run_dir: Path) -> dict[str, pd.DataFrame | dict]:
     """Load manifest + all generation / detection / quality rows of a run into DataFrames."""
     run_dir = Path(run_dir)
     manifest = json.loads((run_dir / "manifest.json").read_text()) if (run_dir / "manifest.json").exists() else {}
     frames = {}
     for kind, keys in (("generations", ("sample_id",)), ("detection", ("sample_id", "text_kind")),
-                       ("quality", ("sample_id",))):
+                       ("quality", ("sample_id",)), ("attacks", ("sample_id",))):
         rows = []
-        for path in sorted((run_dir / kind).glob("*/*.jsonl")):
-            rows.extend(_latest(_read_jsonl(path), keys))
+        pick = _last if kind in ("detection", "attacks") else _latest
+        pattern = "*/*/*.jsonl" if kind == "attacks" else "*/*.jsonl"  # attacks/<dataset>/<attack>/<variant>
+        for path in sorted((run_dir / kind).glob(pattern)):
+            rows.extend(pick(_read_jsonl(path), keys))
         df = pd.DataFrame(rows)
         if not df.empty and "error" not in df.columns:
             df["error"] = None
@@ -96,12 +111,49 @@ def fpr_col(fpr: float, tag: str) -> str:
     return f"tpr@{fpr * 100:g}%fpr_{tag}"
 
 
-def kept_sample_ids(det: pd.DataFrame, cfg: BenchmarkConfig) -> set:
-    """Common exclusion: samples whose human continuation is shorter than ``min_detect_tokens``."""
+def kept_sample_ids(det: pd.DataFrame, cfg: BenchmarkConfig, *, warn: bool = True) -> set:
+    """Samples of *one variant* whose common detection budget reaches ``min_detect_tokens``.
+
+    ``detect_tokens`` is the per-sample length at which stage ``detect`` scored the watermarked,
+    the human and the ``none`` text alike, so the filter keeps the three classes on the same
+    samples at the same lengths. Rows without the field were scored before length control and
+    are refused rather than silently mixed in.
+    """
     if det.empty or "text_kind" not in det:
         return set()
-    human_len = det[det.text_kind == "human"].groupby("sample_id")["n_tokens"].min()
-    return set(human_len[human_len >= cfg.min_detect_tokens].index)
+    legacy = det.detect_tokens.isna() if "detect_tokens" in det.columns else pd.Series(True, index=det.index)
+    if legacy.all():
+        raise RuntimeError("detection rows without `detect_tokens` found: they were scored before detection was "
+                           "length-controlled (schema 2). Re-run stage `detect` for this run.")
+    if legacy.any():
+        if warn:
+            log.warning("%s: ignoring %d detection rows scored before length control (stage `detect` skipped their "
+                        "samples: no `none` generation or an empty common budget)",
+                        "/".join(str(x) for x in det[["dataset", "variant"]].iloc[0]), int(legacy.sum()))
+        det = det[~legacy]
+    wm = det[det.text_kind == "watermarked"].groupby("sample_id")["detect_tokens"].min()
+    return set(wm[wm >= cfg.min_detect_tokens].index)
+
+
+def _same_budget_as_watermarked(dv: pd.DataFrame, label: str, *, warn: bool = True) -> pd.DataFrame:
+    """Keep only rows scored at the budget of their sample's watermarked row (the equal-length invariant).
+
+    Stage ``detect`` writes all kinds of a sample at one ``detect_tokens``; a mismatch means the
+    stage was interrupted between kinds (resume completes it) and such a negative must not be
+    compared with a positive of another length.
+    """
+    pos = dv[dv.text_kind == "watermarked"]
+    other = dv[dv.text_kind != "watermarked"]
+    if other.empty:
+        return dv
+    budget = pos.drop_duplicates("sample_id").set_index("sample_id").detect_tokens
+    bad = other.detect_tokens.values != budget.reindex(other.sample_id).values
+    if not bad.any():
+        return dv
+    if warn:
+        log.warning("%s: dropping %d detection rows whose budget differs from their sample's watermarked row "
+                    "(stage `detect` interrupted? re-run it)", label, int(bad.sum()))
+    return pd.concat([pos, other[~bad]])
 
 
 def _records(df: pd.DataFrame) -> list[dict]:
@@ -114,8 +166,21 @@ def _records(df: pd.DataFrame) -> list[dict]:
 # ----------------------------------------------------------------------------- summaries
 
 
-def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame) -> pd.DataFrame:
-    """Per variant: AUROC / TPR@FPR / best-F1 / fixed-threshold TPR+FPR against human and 'none' negatives."""
+def _attack_names(kinds, cfg: BenchmarkConfig) -> list[str]:
+    """Attack names present as ``attacked:<name>`` kinds, configured attacks first."""
+    names = {str(k).split(":", 1)[1] for k in kinds if str(k).startswith("attacked:")}
+    return [a for a in cfg.attacks if a in names] + sorted(a for a in names if a not in cfg.attacks)
+
+
+def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame,
+                    attacks: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Per variant: AUROC / TPR@FPR / best-F1 / fixed-threshold TPR+FPR against human and 'none' negatives.
+
+    With attacked rows (``attacked:<name>`` kinds) every attack adds ``attacked_*_<name>`` columns: TPR at the
+    threshold fixed on the clean human negatives, AUROC vs the clean human negatives, TPR at the shipped
+    threshold, token count, and the attack strength from the ``attacks`` frame (length ratio, BLEU vs the
+    source text, embedding similarity).
+    """
     rows = []
     if det.empty:
         return pd.DataFrame(rows)
@@ -124,13 +189,19 @@ def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame)
         d = det[det.dataset == dataset]
         if d.empty:
             continue
-        keep = kept_sample_ids(d, cfg)
+        g = gens[gens.dataset == dataset] if not gens.empty and "dataset" in gens else pd.DataFrame()
         for variant in [v for v in cfg.variants if v != "none" and v in set(d.variant)]:
-            dv = d[(d.variant == variant) & (d.sample_id.isin(keep))]
+            dvar = d[d.variant == variant]
+            keep = kept_sample_ids(dvar, cfg)  # per variant: the common budget depends on its own lengths
+            dv = _same_budget_as_watermarked(dvar[dvar.sample_id.isin(keep) & dvar.detect_tokens.notna()],
+                                             f"{dataset}/{variant}")
             pos = dv[dv.text_kind == "watermarked"]
+            gv = g[g.variant == variant] if not g.empty else pd.DataFrame()
             row = {"dataset": dataset, "variant": variant, "score": VARIANTS[variant].score_name,
+                   "n_gen_ok": int(gv.error.isna().sum()) if not gv.empty else None,
                    "n_samples_kept": len(keep), "n_pos": int(pos.score.notna().sum()),
                    "n_pos_nan": int(pos.score.isna().sum()), "pos_mean": float(pos.score.mean()),
+                   "detect_tokens_mean": float(pos.detect_tokens.mean()) if len(pos) else float("nan"),
                    "pos_tokens_mean": float(pos.n_tokens.mean()) if len(pos) else float("nan")}
             for neg_kind, tag in (("human", "human"), ("unwatermarked", "none")):
                 neg = dv[dv.text_kind == neg_kind]
@@ -138,7 +209,8 @@ def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame)
                     continue
                 s = metrics.detection_summary(pos.score, neg.score, pos.is_watermarked, neg.is_watermarked)
                 boot = metrics.detection_bootstrap(pos.score, neg.score, primary, seed=cfg.seed)
-                row.update({f"n_neg_{tag}": s.n_neg, f"neg_mean_{tag}": s.neg_mean, f"auroc_{tag}": s.auroc,
+                row.update({f"n_neg_{tag}": s.n_neg, f"neg_tokens_mean_{tag}": float(neg.n_tokens.mean()),
+                            f"neg_mean_{tag}": s.neg_mean, f"auroc_{tag}": s.auroc,
                             f"auroc_{tag}_ci": _ci(*boot["auroc"])})
                 for f in cfg.target_fprs:
                     row[fpr_col(f, tag)] = metrics.tpr_at_fpr(pos.score, neg.score, f)[0]
@@ -146,16 +218,30 @@ def detection_table(det: pd.DataFrame, cfg: BenchmarkConfig, gens: pd.DataFrame)
                 row.update({f"best_f1_{tag}": s.best_f1,
                             f"fixed_thr_tpr_{tag}": s.fixed_threshold_tpr, f"fixed_thr_fpr_{tag}": s.fixed_threshold_fpr,
                             f"fpr_warning_{tag}": bool(s.n_neg < 1 / primary)})
-            att = dv[dv.text_kind == "attacked"]
             hum = dv[dv.text_kind == "human"]
-            if not att.empty and not hum.empty:
+            names = _attack_names(dv.text_kind.unique(), cfg)
+            if names and not hum.empty:
                 _, thr = metrics.tpr_at_fpr(pos.score, hum.score, primary)
-                a = metrics._clean(att.score)
-                row.update({
-                    "attack": f"word_deletion({cfg.word_deletion_ratio})",
-                    "attacked_tpr_at_clean_thr": float(np.mean(a > thr)) if len(a) else float("nan"),
-                    "attacked_auroc_human": metrics.auroc(att.score, hum.score),
-                })
+                row["attacks"] = ", ".join(names)
+                for name in names:
+                    att = dv[dv.text_kind == f"attacked:{name}"]
+                    a = metrics._clean(att.score)
+                    flags = att.is_watermarked.dropna()
+                    row.update({
+                        f"attacked_n_{name}": int(len(a)),
+                        f"attacked_tpr_at_clean_thr_{name}": float(np.mean(a > thr)) if len(a) else float("nan"),
+                        f"attacked_auroc_human_{name}": metrics.auroc(att.score, hum.score),
+                        f"attacked_fixed_thr_tpr_{name}": float(flags.astype(bool).mean()) if len(flags) else float("nan"),
+                        f"attacked_tokens_mean_{name}": float(att.n_tokens.mean()) if len(att) else float("nan"),
+                    })
+                    if attacks is not None and not attacks.empty and "attack" in attacks:
+                        ar = attacks[(attacks.dataset == dataset) & (attacks.variant == variant)
+                                     & (attacks.attack == name) & attacks.sample_id.isin(keep) & attacks.error.isna()]
+                        if not ar.empty:
+                            sim = pd.to_numeric(ar.sim_embed, errors="coerce") if "sim_embed" in ar else pd.Series(dtype=float)
+                            row.update({f"attack_len_ratio_{name}": float(ar.len_ratio.mean()),
+                                        f"attack_bleu_vs_source_{name}": float(ar.bleu_vs_source.mean()),
+                                        f"attack_sim_embed_{name}": float(sim.mean()) if sim.notna().any() else float("nan")})
             row["fixed_threshold"] = VARIANTS[variant].fixed_threshold
             row["nominal_fpr"] = VARIANTS[variant].nominal_fpr
             rows.append(row)
@@ -282,8 +368,10 @@ def main_table(qt: pd.DataFrame, dt: pd.DataFrame, cfg: BenchmarkConfig) -> pd.D
                             fpr_col(primary, "vs_human"): r.get(fpr_col(primary, "human")),
                             "auroc_vs_none": r.get("auroc_none"),
                             fpr_col(primary, "vs_none"): r.get(fpr_col(primary, "none")),
-                            "fixed_thr_tpr": r.get("fixed_thr_tpr_human"), "fixed_thr_fpr": r.get("fixed_thr_fpr_human"),
-                            "attacked_tpr": r.get("attacked_tpr_at_clean_thr")})
+                            "fixed_thr_tpr": r.get("fixed_thr_tpr_human"), "fixed_thr_fpr": r.get("fixed_thr_fpr_human")})
+                prefix = "attacked_tpr_at_clean_thr_"
+                for col in [c for c in d.columns if c.startswith(prefix)]:
+                    row["attacked_tpr_" + col[len(prefix):]] = r.get(col)
         if len(row) > 1:
             rows.append(row)
     return pd.DataFrame(rows)
@@ -315,22 +403,27 @@ def make_plots(frames: dict, cfg: BenchmarkConfig, out_dir: Path, dt: pd.DataFra
     primary = cfg.target_fprs[0]
     if not det.empty and "dataset" in det:
         d0 = det[det.dataset == DETECTION_DATASETS[0]]
-        keep = kept_sample_ids(d0, cfg)
-        d0 = d0[d0.sample_id.isin(keep)]
         present = [v for v in variants if v in set(d0.variant)]
+        kept = {v: kept_sample_ids(d0[d0.variant == v], cfg, warn=False) for v in present}
+        d0 = pd.concat([_same_budget_as_watermarked(
+            d0[(d0.variant == v) & d0.sample_id.isin(kept[v]) & d0.detect_tokens.notna()], v, warn=False)
+            for v in present]) if present else d0
         if present:
             fig, axes = plt.subplots(1, len(present), figsize=(4 * len(present), 3.2), squeeze=False)
             for ax, variant in zip(axes[0], present):
                 d = d0[d0.variant == variant]
-                for kind, color in (("human", "tab:gray"), ("unwatermarked", "tab:blue"), ("watermarked", "tab:red"),
-                                    ("attacked", "tab:orange")):
+                colors = {"human": "tab:gray", "unwatermarked": "tab:blue", "watermarked": "tab:red"}
+                extra = ("tab:orange", "tab:green", "tab:purple", "tab:brown")
+                for i, name in enumerate(_attack_names(d.text_kind.unique(), cfg)):
+                    colors[f"attacked:{name}"] = extra[i % len(extra)]
+                for kind, color in colors.items():
                     s = d[d.text_kind == kind].score.dropna()
                     if len(s):
                         ax.hist(s, bins=20, alpha=0.5, label=kind, color=color)
                 thr = VARIANTS[variant].fixed_threshold
                 if thr is not None:
                     ax.axvline(thr, color="k", ls="--", lw=1, label="shipped threshold")
-                ax.set_title(f"{variant}: {VARIANTS[variant].score_name} (n kept={len(keep)})", fontsize=8)
+                ax.set_title(f"{variant}: {VARIANTS[variant].score_name} (n kept={len(kept[variant])})", fontsize=8)
                 ax.legend(fontsize=7)
             fig.tight_layout()
             p = out_dir / "score_histograms.png"
@@ -401,7 +494,7 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
     run_dir = cfg.run_dir
     frames = load_run(run_dir)
     gens, det, qual = frames["generations"], frames["detection"], frames["quality"]
-    dt = detection_table(det, cfg, gens)
+    dt = detection_table(det, cfg, gens, frames.get("attacks"))
     qt = quality_table(qual, gens, cfg)
     pdlt = paired_deltas(qual, cfg)
     mt = main_table(qt, dt, cfg)
@@ -427,7 +520,13 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
            f"MarkLLM: `{frames['manifest'].get('markllm_commit', '')[:8]}` | config hash: `{cfg.config_hash()}`", ""]
     md += ["## Main table", "", df_to_markdown(mt), ""]
     md += [f"Detection columns use C4 continuations; negatives are human continuations (`vs_human`) or the `none` "
-           f"variant's generations (`vs_none`). `fixed_thr_*` use each algorithm's shipped threshold. "
+           f"variant's generations (`vs_none`). Per sample and variant the watermarked, human and `none` texts are "
+           f"scored at one common token budget (the shortest of the three, at most `max_new_tokens`); samples whose "
+           f"budget is below `min_detect_tokens` ({cfg.min_detect_tokens}) are excluded (`n_gen_ok` vs "
+           f"`n_samples_kept` in detection_summary.csv). `fixed_thr_*` use each algorithm's shipped threshold. "
+           f"`attacked_tpr_<attack>` is the TPR of the attacked watermarked texts at the threshold fixed on the clean "
+           f"human negatives; attack strength is in `attack_len_ratio_*`, `attack_bleu_vs_source_*` and "
+           f"`attack_sim_embed_*` of detection_summary.csv. "
            f"`tpr@{primary * 100:g}%fpr` is unreliable when fewer than {int(1 / primary)} negatives are available "
            f"(see `fpr_warning_*` in detection_summary.csv).", ""]
     md += ["## Detection", "", df_to_markdown(dt), "", "## Quality per dataset", "", df_to_markdown(qt), "",

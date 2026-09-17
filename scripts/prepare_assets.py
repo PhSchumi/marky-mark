@@ -16,6 +16,8 @@ What is fetched:
   * SIR transform network + compositional-BERT embedder -> artifacts/sir/
   * NLTK punkt / punkt_tab (SemStamp)
   * generator, oracle and (optionally) the SemStamp sentence embedder -> HF cache
+  * with --dipper: the DIPPER paraphraser (T5-XXL, ~22 GB), its tokenizer and the attack
+    similarity model (stage `attack` of the robustness track)
   * artifacts/assets.json with the resolved Hub revisions
 """
 
@@ -48,6 +50,8 @@ def main(argv=None) -> int:
     p.add_argument("--model", default="facebook/opt-1.3b", help="generator model id or local path")
     p.add_argument("--oracle", default="facebook/opt-2.7b", help="PPL oracle id ('none' to skip)")
     p.add_argument("--semstamp", action="store_true", help="also fetch the SemStamp sentence embedder")
+    p.add_argument("--dipper", action="store_true",
+                   help="also fetch the DIPPER paraphraser, its tokenizer and the attack similarity model")
     p.add_argument("--skip-models", action="store_true", help="only MarkLLM, SIR assets and NLTK data")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -73,6 +77,13 @@ def main(argv=None) -> int:
         if args.semstamp:
             bootstrap.ensure_semstamp_assets()
             assets["models"][bootstrap.SEMSTAMP_EMBEDDER_REPO] = _revision(bootstrap.SEMSTAMP_EMBEDDER_REPO)
+        if args.dipper:
+            from wmbench.config import BenchmarkConfig
+
+            cfg = BenchmarkConfig()
+            names = [cfg.dipper_model, cfg.dipper_tokenizer] + ([cfg.attack_similarity_model] if cfg.attack_similarity_model else [])
+            bootstrap.prefetch_models(names)
+            assets["attacks"] = {n: _revision(n) for n in names}
     out = bootstrap.default_artifacts_dir() / "assets.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(assets, indent=2))

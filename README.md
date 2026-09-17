@@ -31,8 +31,8 @@ wmbench/                              the package the notebook and CLI share
   watermarks.py   VariantSpec registry + WatermarkVariant (generate / detect) + MarkLLM patches
   generation.py   seeded, timed, resumable JSONL generation
   metrics.py      PPL, diversity, BLEU, ROUGE, pass@1, AUROC, TPR@FPR, best-F1, bootstrap CIs
-  attacks.py      word-deletion attack
-  evaluate.py     stages: generate -> detect_none -> quality -> report
+  attacks.py      robustness attacks: word deletion, DIPPER paraphrase
+  evaluate.py     stages: generate -> attack -> detect -> quality -> report
   report.py       tables, paired deltas, plots, summary.md
   cli.py          argparse entry point
 configs/watermarks/*.json             per-algorithm hyperparameters (copies of MarkLLM's defaults; edit freely)
@@ -102,6 +102,8 @@ JOBA=$(MODEL=facebook/opt-1.3b RUN=opt13b sbatch --parsable scripts/slurm/array_
 MODEL=facebook/opt-1.3b ORACLE=facebook/opt-2.7b RUN=opt13b sbatch --dependency=afterok:$JOBA scripts/slurm/merge.sbatch
 ```
 
+With the robustness track, `scripts/slurm/attack.sbatch` runs between the two (see "Robustness attacks").
+
 Every stage is resumable: re-submitting continues from the cached JSONL records. A results directory
 belongs to one *data-producing* configuration (model, seed, generation lengths, prompt settings, the
 contents of `configs/watermarks/*.json` and any overrides; hashed into `manifest.json`); which variants,
@@ -134,8 +136,9 @@ if a user-level Jupyter config pulls in extensions that are not installed in the
 
 | stage | what it does | parallelisable |
 |---|---|---|
-| `generate` | for each (dataset, variant): format prompt, generate with a per-sample seed, time it, cache; on C4 also score own continuations, human continuations, optionally attacked continuations | yes: `--variants X` per array task |
-| `detect_none` | each watermark detector scores the `none` generations (harder negatives) | needs `none` |
+| `generate` | for each (dataset, variant): format prompt, generate with a per-sample seed, time it, cache | yes: `--variants X` per array task |
+| `attack` | (`--robustness`) for each attack and watermark variant on C4: attack the common-budget watermarked text of every sample, record strength metrics; one attacker loaded at a time | needs the `none` and the variants' generations; DIPPER needs a 40 GB+ GPU |
+| `detect` | for each watermark variant on C4: score its own, the human and the `none` continuation of every sample at one common token budget (the shortest of the three, at most `max_new_tokens`), plus the `attacked:<name>` texts from stage `attack` | needs the `none` and the variant's generations; `--variants X` per task works |
 | `quality` | PPL with the oracle (generator freed first), diversity, BLEU, ROUGE, pass@1 | needs generations |
 | `report` | pure pandas over the JSONL files | any node (same device type as the run, see below) |
 
@@ -158,19 +161,52 @@ variables (`WMBENCH_*`, see `BenchmarkConfig.from_env`) are applied on top of `-
 | TPR@1%FPR, TPR@5%FPR | threshold = the score exceeded by at most 1% (5%) of negatives; needs >= 100 negatives, flagged otherwise | idem |
 | best F1 | max F1 over thresholds (MarkLLM's `rule='best'`) | idem |
 | fixed-threshold TPR/FPR | each algorithm's shipped threshold (`z=4` KGW, `z=2` MorphMark, p<0.01 PF, 0.52 SynthID, 0.2 SIR) | idem |
-| attacked TPR | word deletion (30%) on watermarked C4 text, scored at the threshold fixed on the clean run (`--robustness`) | idem |
+| attacked TPR (`attacked_tpr_<attack>`) | attacked watermarked C4 texts scored at the threshold fixed on the clean human negatives at 1% FPR; also AUROC vs clean human text and TPR at the shipped threshold (`--robustness`) | idem |
+| attack strength | per attack: `attack_len_ratio` (attacked tokens / budget), `attack_bleu_vs_source` (sacreBLEU vs the clean text; low = heavy rewriting), `attack_sim_embed` (sentence-embedding cosine similarity; high = meaning preserved) | idem |
 | tok/s | continuation tokens / wall-clock generation seconds (batch size 1, untimed warm-up) | `quality_summary.csv` |
 
-All three text classes are truncated to the same token budget (`max_new_tokens` of the dataset), samples
-whose human continuation is shorter than `min_detect_tokens` (50) are excluded for every variant, detector
-failures on degenerate texts are recorded as NaN and counted, and bootstrap 95% CIs are given for the key
-numbers. Paired differences vs `none` on identical prompts (`paired_deltas.csv`) are the most sensitive
-comparison.
+**Length control.** Detection scores accumulate evidence per token, so a watermarked text that stopped
+at 80 tokens must not be compared with a 200-token human text. For every sample the watermarked, the human
+and the `none` text are therefore scored at one common budget
+`T = min(max_new_tokens, |watermarked|, |human|, |none|)` (token counts as the detector re-tokenises them;
+each text is cut to its first `T` tokens). `T` is determined per variant because it depends on that
+variant's own continuation lengths, and is stored as `detect_tokens` in every detection row; attacked
+texts are derived from the truncated watermarked text and capped at `T` tokens. Samples with `T < min_detect_tokens` (50) are
+excluded from that variant's detection numbers (`n_gen_ok` vs `n_samples_kept` in `detection_summary.csv`;
+`pos_tokens_mean` and `neg_tokens_mean_*` show the resulting equal lengths, up to a token at the cut
+boundary where the tokenizer's decode/encode round trip can re-segment a word). Detector failures on
+degenerate texts are recorded as NaN and counted, and bootstrap 95% CIs are given for the key numbers.
+Paired differences vs `none` on identical prompts (`paired_deltas.csv`) are the most sensitive comparison.
+
+## Robustness attacks (`--robustness`)
+
+Stage `attack` rewrites the watermarked C4 texts and stage `detect` scores the result as `attacked:<name>`
+rows; the report answers "how much detectability survives" (`attacked_tpr_<name>` at the clean 1% FPR
+threshold, `attacked_auroc_human_<name>`, `attacked_fixed_thr_tpr_<name>`) next to "how strong was the
+attack" (`attack_len_ratio_<name>`, `attack_bleu_vs_source_<name>`, `attack_sim_embed_<name>`). Negatives
+stay clean: a deployed threshold is calibrated on unattacked text.
+
+| attack | what it does | cost |
+|---|---|---|
+| `word_deletion` | drops each word independently with probability `word_deletion_ratio` (0.3); MarkLLM's `WordDeletion` rule, seeded per sample | none |
+| `dipper` | DIPPER paraphraser (Krishna et al. 2023, [2303.13408](https://arxiv.org/abs/2303.13408)): `kalpeshk2011/dipper-paraphraser-xxl` rewrites the text sentence by sentence, conditioned on the C4 prompt and the paraphrase so far, with MarkLLM's `DipperParaphraser` defaults (lexical diversity 60, order diversity 0, one sentence per window, `top_p 0.75`); re-implemented in `wmbench/attacks.py` so MarkLLM's evaluation module (OpenAI / `translate` imports) is not needed | T5-XXL, ~22 GB in bf16: a 40 GB+ GPU and a few hours for 500 x 6 texts |
+
+Every attack row (`attacks/<dataset>/<attack>/<variant>.jsonl`) is derived from exactly the text scored
+clean (the watermarked continuation cut to the sample's budget `T`), is capped at `T` tokens so a longer
+paraphrase cannot add evidence (`n_tokens_uncapped` keeps the original length), carries a per-sample seed
+`stable_seed(seed, "attack", <attack>, <dataset>, <sample>)` that is identical across variants, and an
+`attack_config_hash` (model id, Hub revision, settings) so changed settings regenerate exactly the affected
+rows. `attack_sim_embed` uses `attack_similarity_model` (`sentence-transformers/all-MiniLM-L6-v2`; `null`
+when the model is not available). Settings: `--attacks`, `--dipper-model`, `dipper_lex_diversity`,
+`dipper_order_diversity`, `dipper_sent_interval`, `dipper_dtype` (auto = bf16 on CUDA), all outside the run
+hash. Prefetch on a node with internet: `python scripts/prepare_assets.py --model ... --oracle ... --dipper`.
+The smoke preset runs `word_deletion` only.
 
 ## Fairness: what is shared and what is not
 
 * **Shared** by every variant: prompt token ids (BOS handled identically, chat template if the tokenizer has
-  one), `max_new_tokens`, natural stopping at EOS, and plain multinomial sampling
+  one), `max_new_tokens`, natural stopping at EOS, one common per-sample detection length for the
+  watermarked / human / `none` texts (see "Length control" above), and plain multinomial sampling
   `temperature=1, top_p=1, top_k=0`. Temperature 1 is the only setting under which KGW/SIR (bias added before
   HF's temperature warper), MorphMark/SynthID (return log-probs of a reweighted distribution) and PF (its own
   decoder) sample from the same base distribution, so it is not configurable.

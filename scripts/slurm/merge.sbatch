@@ -7,7 +7,9 @@
 #SBATCH --output=slurm-%j.out
 #
 # Job B (after array_generate.sbatch): cross-variant stages on one GPU.
-#   detect_none : every watermark detector scores the `none` generations
+#   detect      : every watermark detector scores its own, the human and the `none` continuation of
+#                 each sample at one common token budget (plus the attacked texts from attack.sbatch
+#                 when this job is submitted with --robustness)
 #   quality     : PPL with the oracle (generator is freed first), diversity, BLEU, ROUGE, pass@1
 #   report      : tables and plots (pure pandas)
 
@@ -28,4 +30,4 @@ RUN="${RUN:-$(basename "$MODEL")}"
 
 python scripts/run_benchmark.py --preset full \
   --model "$MODEL" --oracle "$ORACLE" --run-name "$RUN" \
-  --stage detect_none,quality,report --results-root "$WMBENCH_RESULTS" --no-progress "$@"
+  --stage detect,quality,report --results-root "$WMBENCH_RESULTS" --no-progress "$@"

@@ -43,7 +43,7 @@ compares the resulting *watermarked models* on
 * **standard benchmarks** - BLEU on WMT16 German->English, ROUGE on CNN/DailyMail summarisation, and
   optionally pass@1 on HumanEval;
 * **cost** - tokens per second;
-* optionally **robustness** to a word-deletion attack.
+* optionally **robustness** to a word-deletion attack and to DIPPER paraphrasing.
 
 Variants (the "versions" of the model):
 
@@ -146,7 +146,8 @@ ORACLE_MODEL    = None      # PPL oracle; "none" -> score with the generator
 RUN_NAME        = None
 VARIANTS_TO_RUN = None      # e.g. ("none", "KGW", "MorphMark", "PF", "SynthID", "SIR", "SemStamp")
 DATASETS_TO_RUN = None      # e.g. ("c4", "wmt16_de_en", "cnn_dailymail", "humaneval")
-RUN_ROBUSTNESS  = None      # True -> word-deletion attack on C4
+RUN_ROBUSTNESS  = None      # True -> stage `attack` + attacked detection rows on C4
+ATTACKS         = None      # e.g. ("word_deletion", "dipper"); smoke preset: word_deletion only (DIPPER is 11B)
 WATERMARK_OVERRIDES = {}    # e.g. {"KGW": {"delta": 1.5, "gamma": 0.25}} - keys as in configs/watermarks/*.json
 
 if SMOKE_TEST is not None:
@@ -154,7 +155,7 @@ if SMOKE_TEST is not None:
 os.environ.setdefault("WMBENCH_SMOKE_TEST", "1")   # the notebook defaults to the smoke preset
 overrides = {k: v for k, v in {
     "model_name": MODEL_NAME, "variants": VARIANTS_TO_RUN, "datasets": DATASETS_TO_RUN,
-    "run_robustness": RUN_ROBUSTNESS, "run_name": RUN_NAME}.items() if v is not None}
+    "run_robustness": RUN_ROBUSTNESS, "attacks": ATTACKS, "run_name": RUN_NAME}.items() if v is not None}
 if ORACLE_MODEL is not None:
     overrides["oracle_model_name"] = None if str(ORACLE_MODEL).lower() == "none" else ORACLE_MODEL
 cfg = BenchmarkConfig.from_env(watermark_overrides=WATERMARK_OVERRIDES, **overrides)
@@ -325,24 +326,37 @@ else:
 
 # --------------------------------------------------------------------------- stages
 md("""
-## 4. Generate + detect (stage `generate`)
+## 4. Generate (stage `generate`)
 
 For each dataset and variant: format the task prompt (few-shot `German: ... English:` for base models, an
 instruction for chat models; `TL;DR:` for summaries), generate with a per-sample seed derived from
 `(seed, dataset, sample_id, variant)`, time it, and append a record to `results/<run>/generations/<dataset>/<variant>.jsonl`.
-On C4 every watermark variant then scores its own continuations and the (equally truncated) human continuations.
 Records are cached: interrupt and re-run at will. On a cluster this stage is what the SLURM array parallelises.
 """)
 code("""runner.stage_generate()""")
 
 md("""
-## 5. Detection against unwatermarked generations (stage `detect_none`)
+## 4.5 Robustness attacks (stage `attack`, only with `RUN_ROBUSTNESS`)
 
-Human text is the primary negative class (that is what a deployed detector sees). The `none` variant's continuations
-are a second, harder negative set: same model, same prompts, same length, just no watermark. This stage needs the
-`none` generations from stage 4.
+Each configured attack rewrites the watermarked C4 text of every sample (the text cut to the common budget `T`,
+see the next section) and caches it with strength metrics under `attacks/c4/<attack>/<variant>.jsonl`:
+`word_deletion` drops 30% of the words; `dipper` paraphrases sentence by sentence with the DIPPER model
+(T5-XXL, needs a 40 GB+ GPU and `prepare_assets.py --dipper`). The attacked text is capped at `T` tokens so a
+longer paraphrase cannot add evidence; `bleu_vs_source` and `sim_embed` say how far it moved from the original.
 """)
-code("""runner.stage_detect_none()""")
+code("""runner.stage_attack()  # no-op unless cfg.run_robustness""")
+
+md("""
+## 5. Detection at one common length (stage `detect`)
+
+Every watermark detector scores, for each C4 sample, its own continuation, the human continuation (primary negative:
+that is what a deployed detector sees) and the `none` variant's continuation (a second, harder negative: same model,
+same prompt, just no watermark). Detection scores accumulate evidence per token, so the three texts are cut to one
+common budget `T = min(max_new_tokens, len(watermarked), len(human), len(none))` before scoring and `T` is stored as
+`detect_tokens` in every row; the attacked texts from stage 4.5 are scored as `attacked:<name>` rows. This stage
+needs the `none` generations and the variant's own generations from stage 4.
+""")
+code("""runner.stage_detect()""")
 
 md("""
 ## 6. Quality (stage `quality`)
@@ -406,8 +420,13 @@ md("""
   and gain in detectability - the classic trade-off (see `plots/ppl_vs_tpr.png`).
 * **BLEU / ROUGE** with a *base* placeholder model are low for every variant; the differences to `none` (paired deltas)
   are still informative. An instruct model gives more meaningful absolute values.
-* Scores are length-dependent; all three text classes are truncated to the same token budget and samples whose
-  human continuation is shorter than `min_detect_tokens` are excluded for every variant.
+* Scores are length-dependent; per sample the watermarked, human and `none` texts are scored at one common token
+  budget (the shortest of the three, `detect_tokens` in the detection rows) and samples whose budget is below
+  `min_detect_tokens` are excluded from that variant's numbers (`n_gen_ok` vs `n_samples_kept`).
+* `attacked_tpr_<attack>` is the fraction of attacked watermarked texts still flagged at the threshold fixed on the
+  clean human negatives; read it together with the attack strength (`attack_bleu_vs_source_*` low and
+  `attack_sim_embed_*` high = heavy rewriting that kept the meaning). SIR and SemStamp are the schemes that claim
+  paraphrase robustness.
 * Log-likelihood benchmarks (MMLU-style multiple choice) are **invariant** to decoding-time watermarks and are
   therefore not part of this comparison.
 """)

@@ -7,9 +7,10 @@
 #SBATCH --array=0-5
 #SBATCH --output=slurm-%A_%a.out
 #
-# Job A: one array task per variant runs stage "generate" (generation + self-detection on
-# its own and the human texts). Tasks write only to their own <variant>.jsonl files; the shared
-# manifest.json is updated under a lock. Submit job B (merge.sbatch) with --dependency=afterok:<job id>.
+# Job A: one array task per variant runs stage "generate" (generation only; detection needs the
+# `none` generations of every sample and runs in job B). Tasks write only to their own
+# <variant>.jsonl files; the shared manifest.json is updated under a lock. Submit job B
+# (merge.sbatch) with --dependency=afterok:<job id>.
 #
 # Usage:
 #   JOBA=$(MODEL=facebook/opt-1.3b RUN=opt13b sbatch --parsable scripts/slurm/array_generate.sbatch)

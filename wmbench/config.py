@@ -11,7 +11,9 @@ from pathlib import Path
 
 from wmbench.bootstrap import REPO_ROOT
 
-SCHEMA_VERSION = 1
+# 2: detection rows carry `detect_tokens`, the common per-sample token budget at which the watermarked,
+#    human and `none` texts were all scored (stage `detect`); rows without it are refused by the report.
+SCHEMA_VERSION = 2
 
 CONFIG_DIR = REPO_ROOT / "configs" / "watermarks"
 
@@ -65,11 +67,20 @@ class BenchmarkConfig:
     translation_shots: int = 5
     article_max_words: int = 400
     # --- detection --------------------------------------------------------------------
-    min_detect_tokens: int = 50  # samples whose human text is shorter are excluded everywhere
+    min_detect_tokens: int = 50  # report-time: drop samples whose common detection budget (min of the
+    # watermarked / human / none lengths, <= max_new_tokens) is shorter; lowering it re-scores on resume
     target_fprs: tuple[float, ...] = (0.01, 0.05)
     # --- optional tracks --------------------------------------------------------------
-    run_robustness: bool = False
+    run_robustness: bool = False  # stage `attack` + `attacked:<name>` detection rows
+    attacks: tuple[str, ...] = ("word_deletion", "dipper")  # keys of wmbench.attacks.ATTACKS
     word_deletion_ratio: float = 0.3
+    dipper_model: str = "kalpeshk2011/dipper-paraphraser-xxl"  # T5-XXL, ~22 GB in bf16
+    dipper_tokenizer: str = "google/t5-v1_1-xxl"
+    dipper_lex_diversity: int = 60  # MarkLLM DipperParaphraser defaults: lex 60, order 0, one sentence per window
+    dipper_order_diversity: int = 0
+    dipper_sent_interval: int = 1
+    dipper_dtype: str = "auto"  # auto -> bf16 on CUDA, fp32 elsewhere (T5 overflows in fp16)
+    attack_similarity_model: str | None = "sentence-transformers/all-MiniLM-L6-v2"  # None = no embedding similarity
     semstamp_n_max: int = 100
     # --- per-variant JSON overrides, e.g. {"KGW": {"delta": 1.5}} ---------------------
     watermark_overrides: dict[str, dict] = field(default_factory=dict)
@@ -88,9 +99,13 @@ class BenchmarkConfig:
     # Fields that select *which* work is done, how it is reported, or a device/dtype *preference*
     # (the resolved device type and dtype are checked separately through manifest.json).
     # Array tasks with different --variants / --datasets must share one results directory.
+    # Attack settings are excluded too: every attack row carries its own `attack_config_hash`, so a
+    # changed paraphraser regenerates exactly the affected rows (word_deletion_ratio stays in the hash
+    # so run directories created before the attack track keep their hash).
     _HASH_EXCLUDED = ("run_name", "results_root", "target_fprs", "smoke", "oracle_model_name",
                       "min_detect_tokens", "variants", "datasets", "n_samples", "run_robustness",
-                      "device", "dtype")
+                      "device", "dtype", "attacks", "dipper_model", "dipper_tokenizer", "dipper_lex_diversity",
+                      "dipper_order_diversity", "dipper_sent_interval", "dipper_dtype", "attack_similarity_model")
 
     def config_hash(self) -> str:
         """Hash of everything that changes generated records, including the algorithm JSON files."""
@@ -120,6 +135,7 @@ class BenchmarkConfig:
             n_samples={"c4": 8, "wmt16_de_en": 6, "cnn_dailymail": 4, "humaneval": 4},
             max_new_tokens={"c4": 64, "wmt16_de_en": 32, "cnn_dailymail": 48, "humaneval": 128},
             min_detect_tokens=16, semstamp_n_max=4, translation_shots=3, article_max_words=200,
+            attacks=("word_deletion",),  # DIPPER (11B) is no smoke-test model
             smoke=True,
         )
         base.update(kw)
@@ -132,7 +148,8 @@ class BenchmarkConfig:
         Recognised: WMBENCH_SMOKE_TEST (1/0), WMBENCH_MODEL, WMBENCH_ORACLE ("none" for None),
         WMBENCH_RUN_NAME, WMBENCH_VARIANTS (comma list), WMBENCH_DATASETS (comma list),
         WMBENCH_DEVICE, WMBENCH_DTYPE, WMBENCH_SEED, WMBENCH_RESULTS, WMBENCH_N_SAMPLES
-        (JSON object or a single int applied to every dataset), WMBENCH_ROBUSTNESS (1/0).
+        (JSON object or a single int applied to every dataset), WMBENCH_ROBUSTNESS (1/0),
+        WMBENCH_ATTACKS (comma list), WMBENCH_DIPPER_MODEL.
         Explicit ``kw`` (and CLI flags, which the CLI applies afterwards) win over the environment.
         """
         env = os.environ
@@ -170,6 +187,10 @@ class BenchmarkConfig:
                 upd["n_samples"] = {k: int(v) for k in cfg.n_samples}
         if (v := env.get("WMBENCH_ROBUSTNESS")) is not None:
             upd["run_robustness"] = _truthy(v)
+        if v := env.get("WMBENCH_ATTACKS"):
+            upd["attacks"] = tuple(x.strip() for x in v.split(",") if x.strip())
+        if v := env.get("WMBENCH_DIPPER_MODEL"):
+            upd["dipper_model"] = v
         upd.update(kw)
         return cfg.with_updates(**upd)
 
@@ -188,7 +209,7 @@ def load_config_file(path: str | Path) -> BenchmarkConfig:
         data = yaml.safe_load(text)
     else:
         data = json.loads(text)
-    for k in ("variants", "datasets", "target_fprs"):
+    for k in ("variants", "datasets", "target_fprs", "attacks"):
         if k in data and isinstance(data[k], list):
             data[k] = tuple(data[k])
     return BenchmarkConfig(**data)
