@@ -1,0 +1,162 @@
+{
+  "schema_version": 2,
+  "run_name": "opt13b",
+  "config": {
+    "run_name": "opt13b",
+    "model_name": "facebook/opt-1.3b",
+    "tokenizer_name": null,
+    "trust_remote_code": false,
+    "oracle_model_name": "facebook/opt-2.7b",
+    "device": "cuda",
+    "dtype": "auto",
+    "use_chat_template": null,
+    "system_prompt": null,
+    "variants": [
+      "none",
+      "KGW",
+      "MorphMark",
+      "PF",
+      "SynthID",
+      "SIR"
+    ],
+    "datasets": [
+      "c4",
+      "wmt16_de_en",
+      "cnn_dailymail"
+    ],
+    "n_samples": {
+      "c4": 500,
+      "wmt16_de_en": 200,
+      "cnn_dailymail": 100,
+      "humaneval": 164
+    },
+    "max_new_tokens": {
+      "c4": 200,
+      "wmt16_de_en": 64,
+      "cnn_dailymail": 96,
+      "humaneval": 300
+    },
+    "seed": 0,
+    "shuffle_seed": null,
+    "translation_shots": 5,
+    "article_max_words": 400,
+    "min_detect_tokens": 50,
+    "target_fprs": [
+      0.01,
+      0.05
+    ],
+    "run_robustness": false,
+    "attacks": [
+      "word_deletion",
+      "dipper"
+    ],
+    "word_deletion_ratio": 0.3,
+    "dipper_model": "kalpeshk2011/dipper-paraphraser-xxl",
+    "dipper_tokenizer": "google/t5-v1_1-xxl",
+    "dipper_lex_diversity": 60,
+    "dipper_order_diversity": 0,
+    "dipper_sent_interval": 1,
+    "dipper_dtype": "auto",
+    "attack_similarity_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "semstamp_n_max": 100,
+    "watermark_overrides": {},
+    "results_root": "/home/berger/wmbench/results",
+    "smoke": false
+  },
+  "config_hash": "49b0c5450b2e",
+  "markllm_commit": "0a4fe8c642b31b8a8c4993615b1c70a0c300d918",
+  "wmbench_version": "0.1.0",
+  "repo_git_sha": "3e9cb1e1ff9df86f8d9d892d00ea4be42c33dba3",
+  "environment": {
+    "device_type": "cuda",
+    "dtype": "float16",
+    "torch_version": "2.6.0+cu124",
+    "transformers_version": "5.17.0",
+    "python": "3.13.13",
+    "hostname": "tcml-node18",
+    "slurm_job_id": "2326862",
+    "slurm_array_task_id": null
+  },
+  "resolved": {
+    "device": "cuda",
+    "dtype": "float16",
+    "chat_template": false,
+    "oracle_model_name": "facebook/opt-2.7b"
+  },
+  "created": "2026-09-19T18:24:04",
+  "updated": "2026-09-19T23:40:32",
+  "stages_run": [
+    {
+      "stage": "generate",
+      "time": "2026-09-19T23:24:06",
+      "slurm": "2326862",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail"
+      ]
+    },
+    {
+      "stage": "detect",
+      "time": "2026-09-19T23:37:13",
+      "slurm": "2326862",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail"
+      ]
+    },
+    {
+      "stage": "quality",
+      "time": "2026-09-19T23:39:59",
+      "slurm": "2326862",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail"
+      ]
+    },
+    {
+      "stage": "report",
+      "time": "2026-09-19T23:40:32",
+      "slurm": "2326862",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail"
+      ]
+    }
+  ]
+}
