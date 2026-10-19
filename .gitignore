@@ -16,6 +16,7 @@ results/
 hf_cache/
 *.log
 slurm-*.out
+slurm.out
 
 # Paper (written outside the repo; regenerate the assets with scripts/paper_assets.py)
 paper/

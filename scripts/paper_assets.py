@@ -63,8 +63,27 @@ SCORE_TEX = {"KGW": "$z$-score", "MorphMark": "$z$-score", "PF": r"$-\log_{10} p
              "SIR": "mean bias sim."}
 
 
+ATTACK_SHORT = {"word_deletion": "Del.", "dipper": "DIPPER"}
+ATTACK_LONG = {"word_deletion": "Word deletion", "dipper": "DIPPER paraphrase"}
+
+
 def display(v: str) -> str:
     return NAME.get(v, v)
+
+
+def attack_phrase(run: Run, a: str) -> str:
+    """The attack and its strength setting, for captions."""
+    if a == "word_deletion":
+        return f"word deletion (Del.; each word dropped with probability {run.cfg.word_deletion_ratio:g})"
+    if a == "dipper":
+        return (f"DIPPER paraphrasing (lexical diversity {run.cfg.dipper_lex_diversity}, "
+                f"order diversity {run.cfg.dipper_order_diversity})")
+    return a.replace("_", " ")
+
+
+def context_label(m: str) -> str:
+    h = context_width(m)
+    return "semantic" if h is None else f"$h={h}$"
 
 
 # ----------------------------------------------------------------------------- loading
@@ -79,6 +98,7 @@ class Run:
     qt: pd.DataFrame  # report.quality_table
     det: dict[str, pd.DataFrame]  # C4 detection rows per method: kept samples, common budget (as in the report)
     methods: list[str]
+    rob: dict | None = None  # compute_robustness, for runs with an attack stage
 
 
 def load(run_dir: Path) -> Run:
@@ -636,12 +656,23 @@ def tab_main_wide(run: Run, n: pd.DataFrame, cap: dict) -> str:
         mark = r"$^\dagger$" if significant(n, v, f"d_{key}") else r"\phantom{$^\dagger$}"
         return rf" {{\scriptsize({text}){mark}}}"
 
-    body = [r"\setlength{\tabcolsep}{4pt}", r"\begin{tabular}{@{}lcccccccc@{}}", r"\toprule",
-            r" & \multicolumn{2}{c}{Detection (C4)} & \multicolumn{2}{c}{Open-ended text (C4)} & "
-            r"\multicolumn{2}{c}{Downstream tasks} & \multicolumn{2}{c}{Efficiency} \\",
-            r"\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}",
-            r"Method & AUROC$\uparrow$ & TPR@1\%$\uparrow$ & PPL$\downarrow$ & Div.\ (\%)$\uparrow$ "
-            r"& BLEU$\uparrow$ & ROUGE-L$\uparrow$ & tok/s$\uparrow$ & rel.\ \\", r"\midrule"]
+    attacks = run.rob["attacks"] if run.rob else []
+    k = len(attacks)
+    det_cols = 2 + k
+    head_det = (rf"\multicolumn{{2}}{{c}}{{Detection (C4)}} & \multicolumn{{{k}}}{{c}}{{Attacked}}" if k
+                else r"\multicolumn{2}{c}{Detection (C4)}")
+    rules = r"\cmidrule(lr){2-3}" + (rf"\cmidrule(lr){{4-{3 + k}}}" if k else "")
+    rules += "".join(rf"\cmidrule(lr){{{c}-{c + 1}}}" for c in (det_cols + 2, det_cols + 4))
+    rules += rf"\cmidrule(lr){{{det_cols + 6}-{det_cols + 6}}}"
+    body = [rf"\setlength{{\tabcolsep}}{{{1.8 if k else 3.4}pt}}", rf"\begin{{tabular}}{{@{{}}l{'c' * (7 + k)}@{{}}}}",
+            r"\toprule",
+            rf" & {head_det} & \multicolumn{{2}}{{c}}{{Open-ended text (C4)}} & "
+            r"\multicolumn{2}{c}{Downstream tasks} & Speed \\",
+            rules,
+            r"Method & AUROC$\uparrow$ & TPR$_{1\%}\uparrow$ & "
+            + "".join(f"{ATTACK_SHORT.get(a, a)}$\\uparrow$ & " for a in attacks)
+            + r"PPL$\downarrow$ & Div.$\uparrow$ & BLEU$\uparrow$ & R-L$\uparrow$ & tok/s$\uparrow$ \\",
+            r"\midrule"]
     for v in _rows(run):
         r = n.loc[v]
         det, task = v in run.methods, v != "human"
@@ -650,21 +681,25 @@ def tab_main_wide(run: Run, n: pd.DataFrame, cap: dict) -> str:
         body.append(_row([
             _name_cell(v),
             num(r.auroc, 3) if det else "--", num(100 * r.tpr1, 1) if det else "--",
+            *(num(100 * run.rob["per_method"][a][v]["tpr1"], 1) if det else "--" for a in attacks),
             num(r.ppl, 1) + (delta(v, "ppl", num(r.d_ppl, 0, signed=True) + r"\%") if det else ""),
             num(r.diversity, 1) + (delta(v, "div", num(r.d_div, 1, signed=True)) if det else ""),
             (num(r.bleu, 1) + (delta(v, "bleu", num(r.d_bleu, 1, signed=True)) if det else "")) if task else "--",
             (num(r.rl, 1) + (delta(v, "rl", num(r.d_rl, 1, signed=True)) if det else "")) if task else "--",
-            num(r.tps_c4, 1) if task else "--",
-            (num(r.rel_tps_c4, 0) + r"\%") if task else "--"]).rstrip("\n"))
+            num(r.tps_c4, 1) if task else "--"]).rstrip("\n"))
         if v == "none":
             body.append(r"\midrule")
     body += [r"\bottomrule", r"\end{tabular}"]
-    caption = (f"Detection, text quality and cost of five watermarks on {cap['model']}. {cap['detect']}. "
+    attacked = (f" Attacked: TPR (\\%) after {' and after '.join(attack_phrase(run, a) for a in attacks)}, at the "
+                f"threshold set to 1\\% FPR on the clean human-written texts." if k else "")
+    caption = (f"Detection, text quality and cost of five watermarks on {cap['model']}. {cap['detect']}; "
+               f"TPR$_{{1\\%}}$: true-positive rate (\\%) at 1\\% FPR.{attacked} "
                f"{cap['tasks']}. In parentheses: difference to unwatermarked sampling on the same prompts "
                f"(PPL as relative change); $^\\dagger$: its 95\\% paired bootstrap CI excludes zero. "
-               f"{cap['speed']}; rel.: relative to unwatermarked.")
+               f"{cap['speed']}.")
     return _header(run, "Main results, full width, with differences") + _float("table*", "\n".join(body) + "\n",
-                                                                               caption, "tab:main-wide")
+                                                                               caption, "tab:main-wide",
+                                                                               r"\footnotesize")
 
 
 def tab_main_ci(run: Run, n: pd.DataFrame, cap: dict) -> str:
@@ -738,6 +773,40 @@ def tab_detection_compact(run: Run, n: pd.DataFrame, cap: dict) -> str:
                f"distribution implies (none is defined for SynthID and SIR).")
     return _header(run, "Detection, single column") + _float("table", "\n".join(body) + "\n", caption,
                                                              "tab:detection-compact")
+
+
+def tab_robustness(run: Run, n: pd.DataFrame, cap: dict) -> str:
+    """Per attack: its strength on each method's texts, then AUROC and TPR@1% FPR with CIs."""
+    dt = run.dt.set_index("variant")
+    body = [STACK.rstrip("\n"), r"\setlength{\tabcolsep}{2.1pt}", r"\begin{tabular}{@{}lccccc@{}}", r"\toprule",
+            r" & & \multicolumn{2}{c}{Strength} & \multicolumn{2}{c}{Detection} \\",
+            r"\cmidrule(lr){3-4}\cmidrule(lr){5-6}",
+            r"Method & $h$ & BLEU & Sim. & AUROC & TPR@1\% \\"]
+    for a in run.rob["attacks"]:
+        body += [r"\midrule", rf"\multicolumn{{6}}{{@{{}}l}}{{\textit{{{ATTACK_LONG.get(a, a)}}}}} \\"]
+        for m in run.methods:
+            r, d = run.rob["per_method"][a][m], dt.loc[m]
+            body.append(_row([
+                m, "sem." if context_width(m) is None else str(context_width(m)),
+                num(d[f"attack_bleu_vs_source_{a}"], 1),
+                num(d[f"attack_sim_embed_{a}"], 2),
+                rf"\wmbstack{{{num(r['auroc'], 3)}}}{{{ci(r['auroc_lo'], r['auroc_hi'], 3)}}}",
+                rf"\wmbstack{{{num(100 * r['tpr1'], 1)}}}{{{ci(100 * r['tpr1_lo'], 100 * r['tpr1_hi'], 1)}}}",
+            ]).rstrip("\n"))
+    body += [r"\bottomrule", r"\end{tabular}"]
+    sim = run.cfg.attack_similarity_model.split("/")[-1] if getattr(run.cfg, "attack_similarity_model", None) else None
+    caption = (f"Robustness on C4 ({cap['n']} per method). Attacks: "
+               f"{'; '.join(attack_phrase(run, a) for a in run.rob['attacks'])}. $h$: preceding tokens the "
+               f"watermark key depends on (sem.: a semantic embedding of the context). Strength, measured "
+               f"against the clean watermarked text: BLEU, sentence BLEU"
+               + (f"; Sim., cosine similarity of {sim} embeddings" if sim else "; Sim., embedding similarity")
+               + ". Token-length ratio to the clean text before capping at its length: "
+               + "; ".join(f"{ATTACK_LONG.get(a, a).lower()} {dt[f'attack_len_ratio_{a}'].min():.2f}--"
+                           f"{dt[f'attack_len_ratio_{a}'].max():.2f}" for a in run.rob["attacks"])
+               + f". Detection against the clean human-written texts; TPR (\\%) at the threshold set to 1\\% FPR "
+               f"on them; {cap['boot']} below each value.")
+    return _header(run, "Robustness, single column") + _float("table", "\n".join(body) + "\n", caption,
+                                                              "tab:robustness", r"\footnotesize")
 
 
 def tab_quality_deltas(run: Run, n: pd.DataFrame, cap: dict) -> str:
@@ -1058,6 +1127,52 @@ def fig_detection_margin(fw: FigureWriter, run: Run) -> Path:
     return fw.save(fig, "fig_detection_margin")
 
 
+def _repel(y: dict[str, float], gap: float) -> dict[str, float]:
+    """Label positions (log10 units) at least ``gap`` apart, as close to ``y`` as a top-down sweep allows."""
+    order = sorted(y, key=y.get)
+    pos = {k: y[k] for k in order}
+    for lo, hi in zip(order, order[1:]):
+        pos[hi] = max(pos[hi], pos[lo] + gap)
+    shift = (sum(pos.values()) - sum(y.values())) / len(y)  # re-centre the block on the data
+    return {k: v - shift for k, v in pos.items()}
+
+
+def fig_robustness_margin(fw: FigureWriter, run: Run) -> Path:
+    """Median detection margin d' per method, clean and after each attack (log axis), labelled by context width."""
+    plt = fw.plt
+    attacks = run.rob["attacks"]
+    conds = ["Clean", *(ATTACK_LONG.get(a, a).replace(" paraphrase", "") for a in attacks)]
+    # Order by context width: semantic first, then increasing h
+    ms = sorted(run.methods, key=lambda m: -1 if context_width(m) is None else context_width(m))
+    vals = {m: [run.rob["per_method"][attacks[0]][m]["margin_clean_median"],
+                *(run.rob["per_method"][a][m]["margin_median"] for a in attacks)] for m in ms}
+    fig, ax = plt.subplots(figsize=(COL_W, 2.15), layout="constrained")
+    x = np.arange(len(conds))
+    for m in ms:
+        ax.plot(x, vals[m], color=COLOR[m], lw=1.3, zorder=2)
+        ax.plot(x, vals[m], **_ring(m, ms=5), zorder=3)
+    ax.set_yscale("log")
+    lo, hi = min(min(v) for v in vals.values()), max(max(v) for v in vals.values())
+    ax.set_ylim(lo / 1.5, hi * 1.5)
+    gap = 0.115 * math.log10(hi * 1.5 / (lo / 1.5)) / 2.0  # about one 7 pt line on this axis height
+    for side, i, ha, dx in (("left", 0, "right", -0.12), ("right", len(conds) - 1, "left", 0.12)):
+        pos = _repel({m: math.log10(vals[m][i]) for m in ms}, gap)
+        for m in ms:
+            label = f"{m} ({context_label(m)})" if side == "right" else f"{vals[m][i]:.1f}"
+            ax.text(i + dx, 10 ** pos[m], label, color=COLOR[m] if side == "right" else INK2, fontsize=7,
+                    ha=ha, va="center")
+    ax.set_xticks(x, labels=conds)
+    ax.set_xlim(-0.75, len(conds) - 1 + 1.45)
+    ax.spines["bottom"].set_bounds(0, len(conds) - 1)
+    ax.grid(axis="y", which="major")
+    ax.set_axisbelow(True)
+    from matplotlib.ticker import FuncFormatter
+
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.set_ylabel(r"Median margin $d'$ (SDs of human text)")
+    return fw.save(fig, "fig_robustness_margin")
+
+
 def fig_roc(fw: FigureWriter, run: Run) -> Path:
     from sklearn.metrics import roc_curve
 
@@ -1365,8 +1480,10 @@ def main(argv=None) -> int:
     (out / "tables").mkdir(parents=True, exist_ok=True)
     (out / "numbers.json").write_text(json.dumps(json.loads(n.to_json(orient="index")), indent=2))
     if run.cfg.attacks:
-        rob = compute_robustness(run, *load_tokenizers(run))
-        (out / "numbers_robustness.json").write_text(json.dumps(rob, indent=2, default=float))
+        run.rob = compute_robustness(run, *load_tokenizers(run))
+        (out / "numbers_robustness.json").write_text(json.dumps(run.rob, indent=2, default=float))
+        if not run.rob["attacks"]:
+            run.rob = None  # attacks configured but never run
     cap = _captions(run, n)
 
     tables = [
@@ -1382,6 +1499,9 @@ def main(argv=None) -> int:
         ("T7", "tab_methods", tab_methods, True, "Methods, mechanisms and hyperparameters (appendix)"),
         ("T8", "tab_examples", tab_examples, True, "One prompt, every method's continuation (appendix)"),
     ]
+    if run.rob:
+        tables.append(("T9", "tab_robustness", tab_robustness, False,
+                       "Robustness: attack strength, AUROC and TPR at 1% FPR per attack"))
     options: list[Option] = []
     for code, name, fn, wide, note in tables:
         (out / "tables" / f"{name}.tex").write_text(fn(run, n, cap))
@@ -1446,6 +1566,20 @@ def main(argv=None) -> int:
          "continuations pooled): fraction of texts with $p\\le\\alpha$ against the nominal level $\\alpha$. The band "
          "is the 95\\% range expected under perfect calibration. SynthID and SIR ship without a null distribution."),
     ]
+    if run.rob:
+        from scipy.stats import spearmanr
+
+        last = run.rob["per_method"][run.rob["attacks"][-1]]
+        width = [-1 if context_width(m) is None else context_width(m) for m in run.methods]
+        follows_h = spearmanr(width, [last[m]["margin_retained"] for m in run.methods])[0] <= -0.8
+        figures.append((
+            "F10", lambda: fig_robustness_margin(fw, run), "figure", "fig:robustness-margin",
+            "Detection margin clean vs. under attack", False,
+            "Median detection margin $d'$ of the watermarked C4 texts, clean and after each attack, in standard "
+            "deviations of the same detector's scores on clean human-written text (log axis; left: clean values). "
+            "Labels give the context width $h$ the watermark key depends on."
+            + (" The share of the margin that survives falls with $h$, independently of the clean margin."
+               if follows_h else "")))
     for code, make, env, label, note, wide, caption in figures:
         pdf = make()
         (pdf.with_suffix(".tex")).write_text(figure_snippet(run, pdf.stem, env, caption, label))
