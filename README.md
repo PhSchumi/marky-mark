@@ -38,12 +38,36 @@ wmbench/                              the package the notebook and CLI share
 configs/watermarks/*.json             per-algorithm hyperparameters (copies of MarkLLM's defaults; edit freely)
 scripts/run_benchmark.py              CLI  (python scripts/run_benchmark.py --help)
 scripts/prepare_assets.py             prefetch MarkLLM, SIR weights, models for offline nodes
+scripts/paper_assets.py               LaTeX tables, PDF figures and robustness statistics for the paper
 scripts/slurm/*.sbatch                single job, array-over-variants + merge, headless notebook
 tests/                                pytest (fast unit tests; `-m slow` integration tests with opt-125m)
 docs/plans/                           design document and review notes
+run_results/                          the results reported in the paper (see "Results of this study")
 ```
 
 Runtime artifacts (`third_party/MarkLLM`, `artifacts/`, `results/`) are git-ignored.
+
+## Results of this study
+
+The runs behind the paper are committed under `run_results/` (copied from the cluster's `results/`):
+
+| directory | run | contents |
+|---|---|---|
+| `run_results/opt13b/` | `scripts/slurm/all_in_one_robustness.sbatch`, OPT-1.3B, oracle OPT-2.7B | **the reported run**: clean detection, quality, speed, and the word-deletion and DIPPER attacks |
+| `run_results/opt13b_clean/` | the same configuration without the attack stage | an earlier run; its clean results are identical to `opt13b/` |
+
+Start with `run_results/opt13b/summary.md`. The per-sample records (`generations/`, `attacks/`,
+`detection/`, `quality/`) let every number be recomputed with `--stage report`. The paper's tables,
+figures and quoted numbers come from
+
+```bash
+python scripts/paper_assets.py --run run_results/opt13b --out paper --compile
+```
+
+which writes `paper/tables/`, `paper/figures/`, `paper/numbers.json` (clean detection, quality, cost),
+`paper/numbers_robustness.json` (statistics under attack) and a gallery `paper/preview.pdf`. The
+context-survival and SIR-truncation statistics load the generator and SIR-embedder tokenizers from the
+Hugging Face hub (or `HF_HOME`) and are skipped with a warning when these are unavailable.
 
 ## Quickstart
 

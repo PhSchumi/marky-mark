@@ -17,6 +17,9 @@ hf_cache/
 *.log
 slurm-*.out
 
+# Paper (written outside the repo; regenerate the assets with scripts/paper_assets.py)
+paper/
+
 # OS / editors
 .DS_Store
 .vscode/
