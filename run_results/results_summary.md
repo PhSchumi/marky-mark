@@ -1,6 +1,6 @@
-# Results summary: `opt13b/dipper_run`
+# Results summary: `opt13b`
 
-`dipper_run` benchmarks five text watermarking methods on `facebook/opt-1.3b`. It measures three things: how much each watermark hurts text quality, how reliably it can be detected, and whether it survives two attacks.
+`opt13b` (formerly `dipper_run`) benchmarks five text watermarking methods on `facebook/opt-1.3b`. It measures three things: how much each watermark hurts text quality, how reliably it can be detected, and whether it survives two attacks.
 
 ## Watermarking methods
 - **KGW**: the classic "green list" method, which nudges the model toward a secret subset of words.
@@ -42,4 +42,4 @@ Translation and summarization show whether a watermark hurts tasks that have a "
   - MorphMark and SynthID stay close to unwatermarked text.
   - PF has the lowest perplexity but also the lowest word diversity, so it tends to repeat itself.
 
-SemStamp isn't part of this run. Its results are in `opt13b/dipper_semstamp_run`.
+SemStamp isn't part of this run. Its results are in `opt13b/sem_stamp_run`.
