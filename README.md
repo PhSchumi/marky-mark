@@ -3,7 +3,7 @@
 Take one Hugging Face causal language model, watermark it six different ways with the
 [MarkLLM](https://github.com/THU-BPM/MarkLLM) toolkit, and compare the watermarked "versions" on
 detectability, text quality (perplexity, diversity), standard benchmarks (BLEU on WMT16 de-en, ROUGE on
-CNN/DailyMail, optionally pass@1 on HumanEval) and speed. Built for a GPU cluster (SLURM, offline compute
+CNN/DailyMail, optionally accuracy on GSM8K and pass@1 on HumanEval) and speed. Built for a GPU cluster (SLURM, offline compute
 nodes) with a narrated Jupyter notebook on top.
 
 | variant | family | detection score | paper |
@@ -136,7 +136,25 @@ jobs that share it. A mismatch is refused unless `--force-new-run`. Cached recor
 effective hyperparameters and the prompt hash of the variant that produced them, so editing a JSON file
 regenerates exactly the affected records. Results land in
 `results/<run-name>/` (`summary.md`, `summary.csv`, `detection_summary.csv`, `quality_summary.csv`,
-`paired_deltas.csv`, `plots/`, per-sample `generations/`, `detection/`, `quality/`, `manifest.json`, `logs/`).
+`paired_deltas.csv`, `degradation.csv`, `plots/`, per-sample `generations/`, `detection/`, `quality/`,
+`manifest.json`, `logs/`).
+
+### 4b. Qwen2.5 run with GSM8K (one submission)
+
+`scripts/slurm/qwen_full.sbatch` runs the whole study on `Qwen/Qwen2.5-1.5B-Instruct` (bf16) with
+`Qwen/Qwen2.5-7B-Instruct` as perplexity oracle: all five watermarks plus `none`, C4 / WMT16 /
+CNN-DailyMail, 500 GSM8K math problems, and the word-deletion and DIPPER attacks. Submit it from the repo
+root on the cluster:
+
+```bash
+git pull && sbatch scripts/slurm/qwen_full.sbatch
+```
+
+It takes roughly 15-18 h on one L40S. Fifteen minutes before the 20 h limit it resubmits itself (at most
+three times) and resumes from the cached records. At the end it packs the run into
+`~/wmbench/results/qwen15b-<timestamp>.tar.gz` and prints the `scp` command to download it. The headline
+file is `degradation.csv`: per task and watermark the unwatermarked value, the watermarked value and the %
+change with a paired bootstrap 95% CI (also a section of `summary.md`).
 
 ### 5. Notebook
 
@@ -163,7 +181,7 @@ if a user-level Jupyter config pulls in extensions that are not installed in the
 | `generate` | for each (dataset, variant): format prompt, generate with a per-sample seed, time it, cache | yes: `--variants X` per array task |
 | `attack` | (`--robustness`) for each attack and watermark variant on C4: attack the common-budget watermarked text of every sample, record strength metrics; one attacker loaded at a time | needs the `none` and the variants' generations; DIPPER needs a 40 GB+ GPU |
 | `detect` | for each watermark variant on C4: score its own, the human and the `none` continuation of every sample at one common token budget (the shortest of the three, at most `max_new_tokens`), plus the `attacked:<name>` texts from stage `attack` | needs the `none` and the variant's generations; `--variants X` per task works |
-| `quality` | PPL with the oracle (generator freed first), diversity, BLEU, ROUGE, pass@1 | needs generations |
+| `quality` | PPL with the oracle (generator freed first), diversity, BLEU, ROUGE, pass@1, GSM8K accuracy | needs generations |
 | `report` | pure pandas over the JSONL files | any node (same device type as the run, see below) |
 
 Detection on CPU and CUDA is **not** interchangeable: MarkLLM seeds `torch.Generator(device=...)` and the
@@ -181,6 +199,8 @@ variables (`WMBENCH_*`, see `BenchmarkConfig.from_env`) are applied on top of `-
 | BLEU | sacreBLEU corpus BLEU of the post-processed answer vs the WMT16 reference (first line, `German:` cue stripped); mean sentence BLEU + CI too | `quality/wmt16_de_en` |
 | ROUGE-1/2/L | `rouge_score` F-measure with stemming vs CNN/DailyMail highlights (first paragraph of the answer) | `quality/cnn_dailymail` |
 | pass@1 | HumanEval unit tests executed in a subprocess with a timeout (optional; `--datasets ...,humaneval`) | `quality/humaneval` |
+| GSM8K accuracy | share of math problems whose final number (last `\boxed{}`, else after `####`, else the last number) equals the gold answer; zero-shot chain-of-thought prompt; test split from OpenAI's repository at a pinned commit (optional; `--datasets ...,gsm8k`) | `quality/gsm8k` |
+| % change vs `none` | `mean(variant) / mean(none) - 1` on the same prompts with a paired bootstrap 95% CI; for perplexity the ratio of geometric means | `degradation.csv`, `paired_deltas.csv` |
 | AUROC | watermarked vs negative scores; negatives = human C4 continuations (`_human`) or `none` generations (`_none`) | `detection_summary.csv` |
 | TPR@1%FPR, TPR@5%FPR | threshold = the score exceeded by at most 1% (5%) of negatives; needs >= 100 negatives, flagged otherwise | idem |
 | best F1 | max F1 over thresholds (MarkLLM's `rule='best'`) | idem |

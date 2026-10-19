@@ -23,6 +23,17 @@ QUALITY_COLUMNS = {
     "translation": ("bleu_sentence", "answer_words"),
     "summarization": ("rouge1", "rouge2", "rougeL", "answer_words"),
     "code": ("passed",),
+    "math": ("correct",),
+}
+
+# Headline metric per task for the degradation table: (dataset, paired_deltas metric) -> (label, better).
+DEGRADATION_METRICS = {
+    ("c4", "log_ppl"): ("perplexity (oracle)", "lower"),
+    ("c4", "diversity"): ("diversity", "higher"),
+    ("wmt16_de_en", "bleu_sentence"): ("BLEU (sentence mean)", "higher"),
+    ("cnn_dailymail", "rougeL"): ("ROUGE-L", "higher"),
+    ("gsm8k", "accuracy"): ("accuracy", "higher"),
+    ("humaneval", "pass"): ("pass@1", "higher"),
 }
 
 
@@ -303,19 +314,29 @@ def quality_table(qual: pd.DataFrame, gens: pd.DataFrame, cfg: BenchmarkConfig) 
             elif task.kind == "code":
                 row.update(pass_at_1=float(qok.passed.astype(float).mean()),
                            pass_at_1_ci=_ci(*metrics.bootstrap_ci(qok.passed.astype(float), seed=cfg.seed)))
+            elif task.kind == "math":
+                correct = qok.correct.astype(float)
+                row.update(accuracy=float(correct.mean()),
+                           accuracy_ci=_ci(*metrics.bootstrap_ci(correct, seed=cfg.seed)))
             rows.append(row)
     return pd.DataFrame(rows)
 
 
 def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
-    """Per-sample paired differences variant - none (same prompts) with bootstrap CIs."""
+    """Per-sample paired differences variant - none (same prompts) with bootstrap CIs.
+
+    Besides the absolute difference, every row has the relative change in percent
+    (``rel_change_pct`` = mean(variant) / mean(none) - 1, with a paired bootstrap CI). For ``log_ppl``
+    the means are geometric-mean perplexities and the change is ``exp(delta) - 1``.
+    """
     rows = []
     if qual.empty:
         return pd.DataFrame(rows)
     specs = {"c4": [("log_ppl", "ppl", np.log), ("diversity", "diversity", None)],
              "wmt16_de_en": [("bleu_sentence", "bleu_sentence", None)],
              "cnn_dailymail": [("rougeL", "rougeL", None)],
-             "humaneval": [("pass", "passed", None)]}
+             "humaneval": [("pass", "passed", None)],
+             "gsm8k": [("accuracy", "correct", None)]}
     for dataset, items in specs.items():
         base = qual[(qual.dataset == dataset) & (qual.variant == "none") & qual.error.isna()].set_index("sample_id")
         if base.empty:
@@ -332,8 +353,42 @@ def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
                 if fn is not None:
                     a, b = fn(a), fn(b)
                 lo, hi = metrics.paired_bootstrap_ci(a, b, seed=cfg.seed)
+                delta = float(np.nanmean(a - b))
+                if fn is np.log:  # back on the perplexity scale: geometric means and their ratio
+                    base_mean = float(np.exp(np.nanmean(b)))
+                    variant_mean = float(np.exp(np.nanmean(a)))
+                    rel = (math.exp(delta) - 1) * 100
+                    rel_lo = (math.exp(lo) - 1) * 100 if math.isfinite(lo) else float("nan")
+                    rel_hi = (math.exp(hi) - 1) * 100 if math.isfinite(hi) else float("nan")
+                else:
+                    base_mean = float(np.nanmean(b))
+                    variant_mean = float(np.nanmean(a))
+                    rel = (variant_mean / base_mean - 1) * 100 if base_mean != 0 else float("nan")
+                    rel_lo, rel_hi = metrics.paired_bootstrap_rel_ci(a, b, seed=cfg.seed)
                 rows.append({"dataset": dataset, "variant": variant, "metric": metric, "n_pairs": len(common),
-                             "delta_vs_none": float(np.nanmean(a - b)), "ci_low": lo, "ci_high": hi})
+                             "delta_vs_none": delta, "ci_low": lo, "ci_high": hi,
+                             "base_mean": base_mean, "variant_mean": variant_mean,
+                             "rel_change_pct": rel, "rel_ci_low": rel_lo, "rel_ci_high": rel_hi})
+    return pd.DataFrame(rows)
+
+
+def degradation_table(pdlt: pd.DataFrame) -> pd.DataFrame:
+    """Headline quality metric per task and watermark: unwatermarked value, watermarked value, % change.
+
+    Built from :func:`paired_deltas` (same prompts, paired bootstrap 95% CI). ``better`` says which
+    direction is an improvement, so a negative change is a loss for "higher" metrics and a gain for "lower".
+    """
+    rows = []
+    if pdlt.empty:
+        return pd.DataFrame(rows)
+    for _, r in pdlt.iterrows():
+        key = (r.dataset, r.metric)
+        if key not in DEGRADATION_METRICS:
+            continue
+        label, better = DEGRADATION_METRICS[key]
+        rows.append({"dataset": r.dataset, "metric": label, "better": better, "variant": r.variant,
+                     "n_pairs": r.n_pairs, "none": r.base_mean, "watermarked": r.variant_mean,
+                     "change_pct": r.rel_change_pct, "change_pct_ci": _ci(r.rel_ci_low, r.rel_ci_high, nd=1)})
     return pd.DataFrame(rows)
 
 
@@ -360,6 +415,9 @@ def main_table(qt: pd.DataFrame, dt: pd.DataFrame, cfg: BenchmarkConfig) -> pd.D
             he = qt[(qt.dataset == "humaneval") & (qt.variant == variant)]
             if not he.empty:
                 row["pass@1"] = he.iloc[0].get("pass_at_1")
+            gsm = qt[(qt.dataset == "gsm8k") & (qt.variant == variant)]
+            if not gsm.empty:
+                row["gsm8k_acc"] = gsm.iloc[0].get("accuracy")
         if not dt.empty:
             d = dt[dt.variant == variant]
             if not d.empty:
@@ -471,7 +529,8 @@ def make_plots(frames: dict, cfg: BenchmarkConfig, out_dir: Path, dt: pd.DataFra
         paths.append(p)
     if not qt.empty:
         bars = []
-        for dataset, col in (("wmt16_de_en", "bleu_corpus"), ("cnn_dailymail", "rougeL"), ("humaneval", "pass_at_1")):
+        for dataset, col in (("wmt16_de_en", "bleu_corpus"), ("cnn_dailymail", "rougeL"), ("humaneval", "pass_at_1"),
+                             ("gsm8k", "accuracy")):
             t = qt[(qt.dataset == dataset) & (qt.variant != "human")]
             if not t.empty and col in t and t[col].notna().any():
                 bars.append((f"{dataset}: {col}", t.set_index("variant")[col]))
@@ -497,11 +556,13 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
     dt = detection_table(det, cfg, gens, frames.get("attacks"))
     qt = quality_table(qual, gens, cfg)
     pdlt = paired_deltas(qual, cfg)
+    dg = degradation_table(pdlt)
     mt = main_table(qt, dt, cfg)
     mt.to_csv(run_dir / "summary.csv", index=False)
     dt.to_csv(run_dir / "detection_summary.csv", index=False)
     qt.to_csv(run_dir / "quality_summary.csv", index=False)
     pdlt.to_csv(run_dir / "paired_deltas.csv", index=False)
+    dg.to_csv(run_dir / "degradation.csv", index=False)
     plot_paths: list[Path] = []
     if plots:
         try:
@@ -529,13 +590,19 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
            f"`attack_sim_embed_*` of detection_summary.csv. "
            f"`tpr@{primary * 100:g}%fpr` is unreliable when fewer than {int(1 / primary)} negatives are available "
            f"(see `fpr_warning_*` in detection_summary.csv).", ""]
+    md += ["## Quality degradation vs. unwatermarked (%)", "",
+           "Same prompts for every variant. `change_pct` = watermarked / unwatermarked - 1, with a paired "
+           "bootstrap 95% CI. `better` says which direction is an improvement (perplexity: lower).", "",
+           df_to_markdown(dg), ""]
     md += ["## Detection", "", df_to_markdown(dt), "", "## Quality per dataset", "", df_to_markdown(qt), "",
            "## Paired differences vs `none` (same prompts, bootstrap 95% CI)", "", df_to_markdown(pdlt), ""]
     if plot_paths:
         md += ["## Plots", ""] + [f"![{p.stem}](plots/{p.name})" for p in plot_paths] + [""]
     (run_dir / "summary.md").write_text("\n".join(md))
     (run_dir / "results.json").write_text(json.dumps({
-        "main": _records(mt), "detection": _records(dt), "quality": _records(qt), "paired_deltas": _records(pdlt)},
+        "main": _records(mt), "detection": _records(dt), "quality": _records(qt), "paired_deltas": _records(pdlt),
+        "degradation": _records(dg)},
         indent=2, allow_nan=False))
     log.info("report written to %s", run_dir / "summary.md")
-    return {"main": mt, "detection": dt, "quality": qt, "paired_deltas": pdlt, "plots": plot_paths, "frames": frames}
+    return {"main": mt, "detection": dt, "quality": qt, "paired_deltas": pdlt, "degradation": dg,
+            "plots": plot_paths, "frames": frames}

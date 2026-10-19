@@ -129,6 +129,34 @@ def test_build_report_end_to_end(synthetic_run):
     json.loads((cfg.run_dir / "results.json").read_text(), parse_constant=_no_const)  # no bare NaN tokens
 
 
+def test_gsm8k_accuracy_and_degradation_table(synthetic_run):
+    cfg = synthetic_run.with_updates(datasets=("c4", "wmt16_de_en", "gsm8k"))
+    n_correct = {"none": 8, "KGW": 6, "PF": 8}
+    for variant, k in n_correct.items():
+        _write(cfg.run_dir / "generations" / "gsm8k" / f"{variant}.jsonl",
+               [{"sample_id": f"gsm8k-{i}", "dataset": "gsm8k", "variant": variant, "error": None,
+                 "continuation": "x", "continuation_tokens": 100, "gen_seconds": 1.0, "prompt_text": "p",
+                 "answer": "1", "reference": "1", "human_text": None} for i in range(10)])
+        _write(cfg.run_dir / "quality" / "gsm8k" / f"{variant}.jsonl",
+               [{"sample_id": f"gsm8k-{i}", "dataset": "gsm8k", "variant": variant, "error": None,
+                 "correct": i < k} for i in range(10)])
+    out = build_report(cfg, plots=False)
+    main = out["main"].set_index("variant")
+    assert main.loc["none", "gsm8k_acc"] == pytest.approx(0.8)
+    assert main.loc["KGW", "gsm8k_acc"] == pytest.approx(0.6)
+    deg = out["degradation"].set_index(["dataset", "variant", "metric"])
+    kgw = deg.loc[("gsm8k", "KGW", "accuracy")]
+    assert kgw.none == pytest.approx(0.8) and kgw.watermarked == pytest.approx(0.6)
+    assert kgw.change_pct == pytest.approx(-25.0)
+    assert deg.loc[("gsm8k", "PF", "accuracy")].change_pct == pytest.approx(0.0)
+    ppl = deg.loc[("c4", "KGW", "perplexity (oracle)")]
+    assert ppl.none == pytest.approx(10.0) and ppl.watermarked == pytest.approx(12.0)
+    assert ppl.change_pct == pytest.approx(20.0) and ppl.better == "lower"
+    assert deg.loc[("wmt16_de_en", "PF", "BLEU (sentence mean)")].change_pct == pytest.approx(-50.0)
+    assert (cfg.run_dir / "degradation.csv").exists()
+    assert "Quality degradation vs. unwatermarked" in (cfg.run_dir / "summary.md").read_text()
+
+
 def test_report_survives_all_error_quality_rows_and_missing_quality(synthetic_run):
     cfg = synthetic_run
     _write(cfg.run_dir / "quality" / "wmt16_de_en" / "KGW.jsonl",

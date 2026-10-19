@@ -13,6 +13,7 @@ Then in the job scripts::
 
 What is fetched:
   * MarkLLM at the pinned commit -> third_party/MarkLLM (datasets ship inside it)
+  * GSM8K test split (OpenAI repository, pinned commit) -> artifacts/gsm8k/test.jsonl
   * SIR transform network + compositional-BERT embedder -> artifacts/sir/
   * NLTK punkt / punkt_tab (SemStamp)
   * generator, oracle and (optionally) the SemStamp sentence embedder -> HF cache
@@ -62,13 +63,17 @@ def main(argv=None) -> int:
     for rel in ("dataset/c4/processed_c4.json", "dataset/wmt16_de_en/validation.jsonl",
                 "dataset/cnn_dailymail/test-00000-of-00001.jsonl", "dataset/human_eval/test.jsonl"):
         assert (root / rel).exists(), f"missing dataset file {root / rel}"
+    gsm8k = bootstrap.ensure_gsm8k()
+    log.info("GSM8K test split: %s", gsm8k)
     sir = bootstrap.ensure_sir_assets()
     log.info("SIR assets: %s", sir)
     bootstrap.ensure_nltk()
 
     assets = {"markllm_commit": bootstrap.MARKLLM_COMMIT, "sir": sir,
               "sir_transform_revision": _revision(bootstrap.SIR_TRANSFORM_REPO),
-              "sir_embedder_revision": _revision(bootstrap.SIR_EMBEDDER_REPO), "models": {}}
+              "sir_embedder_revision": _revision(bootstrap.SIR_EMBEDDER_REPO),
+              "gsm8k": {"path": str(gsm8k), "commit": bootstrap.GSM8K_COMMIT, "sha1": bootstrap.file_sha1(gsm8k)},
+              "models": {}}
     if not args.skip_models:
         names = [args.model] + ([] if args.oracle.lower() in ("none", "") else [args.oracle])
         bootstrap.prefetch_models(names)

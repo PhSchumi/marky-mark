@@ -7,16 +7,20 @@ All datasets ship inside the pinned MarkLLM checkout (``third_party/MarkLLM/data
 * ``wmt16_de_en``   - WMT16 German->English validation pairs (translation; BLEU).
 * ``cnn_dailymail`` - CNN/DailyMail test articles with highlights (summarisation; ROUGE).
 * ``humaneval``     - HumanEval problems (code; pass@1). Executes model code, off by default.
+
+``gsm8k`` (grade-school math word problems; final-answer accuracy) is not part of MarkLLM: its
+test split is downloaded once from OpenAI's repository by :func:`wmbench.bootstrap.ensure_gsm8k`.
 """
 
 from __future__ import annotations
 
 import json
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from wmbench.bootstrap import markllm_dir
+from wmbench.bootstrap import ensure_gsm8k, markllm_dir
 
 
 @dataclass
@@ -31,7 +35,7 @@ class Sample:
 @dataclass(frozen=True)
 class TaskSpec:
     name: str
-    kind: str  # completion | translation | summarization | code
+    kind: str  # completion | translation | summarization | code | math
     file: str
     quality_metrics: tuple[str, ...]
     max_new_tokens: int
@@ -48,6 +52,8 @@ TASKS: dict[str, TaskSpec] = {
                               ("rouge",), 96, "News summarisation scored with ROUGE-1/2/L."),
     "humaneval": TaskSpec("humaneval", "code", "dataset/human_eval/test.jsonl",
                           ("pass@1",), 300, "Python function completion scored by executing the unit tests."),
+    "gsm8k": TaskSpec("gsm8k", "math", "gsm8k/test.jsonl", ("accuracy",), 512,
+                      "Grade-school math word problems; the final number must match the gold answer."),
 }
 
 # ----------------------------------------------------------------------------- prompt templates
@@ -56,6 +62,8 @@ TRANSLATION_INSTRUCTION = "Translate the following German sentence into English.
 SUMMARY_INSTRUCTION = "Summarize the following news article in two or three sentences."
 CODE_INSTRUCTION = "Complete the following Python function. Reply with the code of the function body only."
 COMPLETION_INSTRUCTION = "Continue the following text. Reply with the continuation only."
+# Qwen2.5's recommended math prompt; the final answer ends up in \boxed{...}.
+MATH_INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 
 _TRANSLATION_SHOT = "German: {de}\nEnglish: {en}"
 
@@ -91,8 +99,67 @@ class PromptTemplates:
     def code(self, problem: str) -> str:
         return f"{CODE_INSTRUCTION}\n\n```python\n{problem}\n```" if self.chat else problem
 
+    def math(self, question: str) -> str:
+        if self.chat:
+            return f"{question}\n\n{MATH_INSTRUCTION}"
+        return f"Question: {question}\nAnswer: Let's think step by step."
+
 
 # ----------------------------------------------------------------------------- post-processing
+
+_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def _last_boxed(text: str) -> str | None:
+    """Content of the last ``\\boxed{...}`` (nested braces allowed), or None."""
+    start = text.rfind("\\boxed{")
+    if start < 0:
+        return None
+    i = start + len("\\boxed{")
+    depth = 1
+    content = []
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(content)
+        content.append(ch)
+        i += 1
+    return None
+
+
+def _first_number(text: str) -> str:
+    match = _NUMBER.search(text)
+    return match.group().replace(",", "") if match else ""
+
+
+def _last_number(text: str) -> str:
+    matches = _NUMBER.findall(text)
+    return matches[-1].replace(",", "") if matches else ""
+
+
+def extract_math_answer(text: str) -> str:
+    """Final number of a math solution: last ``\\boxed{}``, else after ``####``, else the last number.
+
+    Commas are removed (``1,234`` -> ``1234``); returns ``""`` when no number is found.
+    """
+    text = text.split("\nQuestion:")[0]  # base models go on with the next few-shot style question
+    boxed = _last_boxed(text)
+    if boxed is not None and _first_number(boxed):
+        return _first_number(boxed)
+    if "####" in text:
+        after = _first_number(text.split("####")[-1])
+        if after:
+            return after
+    return _last_number(text)
+
+
+def gsm8k_gold(answer: str) -> str:
+    """Gold number of a GSM8K solution (the text after ``####``), commas removed."""
+    return answer.split("####")[-1].strip().replace(",", "")
 
 
 def postprocess(kind: str, continuation: str) -> str:
@@ -122,6 +189,8 @@ def postprocess(kind: str, continuation: str) -> str:
         from wmbench.metrics import clean_code_completion
 
         return clean_code_completion(text).rstrip()
+    if kind == "math":
+        return extract_math_answer(continuation)
     return continuation
 
 
@@ -150,7 +219,10 @@ def load_task(name: str, n_samples: int, templates: PromptTemplates | None = Non
     """
     spec = TASKS[name]
     templates = templates or PromptTemplates()
-    path = (markllm_root or markllm_dir()) / spec.file
+    if spec.kind == "math":
+        path = ensure_gsm8k()
+    else:
+        path = (markllm_root or markllm_dir()) / spec.file
     if not path.exists():
         raise FileNotFoundError(f"{path} not found; run wmbench.bootstrap.ensure_markllm() first")
 
@@ -186,4 +258,8 @@ def load_task(name: str, n_samples: int, templates: PromptTemplates | None = Non
             samples.append(Sample(r["task_id"].replace("/", "-"), templates.code(prompt),
                                   {"task": prompt, "test": r["test"], "entry_point": r["entry_point"]},
                                   r.get("canonical_solution")))
+    elif spec.kind == "math":
+        for i, r in enumerate(chosen):
+            samples.append(Sample(f"gsm8k-{i}", templates.math(r["question"]), gsm8k_gold(r["answer"]),
+                                  None, {"solution": r["answer"]}))
     return samples

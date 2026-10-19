@@ -31,6 +31,12 @@ SIR_TRANSFORM_FILE = "transform_model_cbert.pth"
 SIR_EMBEDDER_REPO = "perceptiveshawty/compositional-bert-large-uncased"
 SEMSTAMP_EMBEDDER_REPO = "AbeHou/SemStamp-c4-sbert"
 
+# GSM8K test split (1,319 problems) from OpenAI's repository, pinned to one commit and checked by sha1.
+GSM8K_COMMIT = "3101c7d5072418e28b9008a6636bde82a006892c"
+GSM8K_URL = (f"https://raw.githubusercontent.com/openai/grade-school-math/{GSM8K_COMMIT}"
+             "/grade_school_math/data/test.jsonl")
+GSM8K_SHA1 = "4a3eef48d6039e82f52dd15af8dfc7f4ea369d42"
+
 # MarkLLM uses generic top-level package names. They must resolve to the MarkLLM
 # checkout, so the checkout is inserted at the front of sys.path.
 _MARKLLM_TOP_LEVEL = ("watermark", "utils", "evaluation", "exceptions", "visualize")
@@ -175,6 +181,29 @@ def sir_mapping_path(vocab_size: int, artifacts: Path | None = None, *, seed: in
         mapping = [rng.randint(0, scale_dimension - 1) for _ in range(vocab_size)]
         path.write_text(json.dumps(mapping))
     return str(path)
+
+
+def file_sha1(path: Path) -> str:
+    import hashlib
+
+    return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+
+
+def ensure_gsm8k(artifacts: Path | None = None) -> Path:
+    """Download the GSM8K test split (pinned commit, sha1-checked) once; return its path."""
+    path = (artifacts or default_artifacts_dir()) / "gsm8k" / "test.jsonl"
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    log.info("downloading %s", GSM8K_URL)
+    urllib.request.urlretrieve(GSM8K_URL, tmp)
+    sha = file_sha1(tmp)
+    if sha != GSM8K_SHA1:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"GSM8K download has sha1 {sha}, expected {GSM8K_SHA1}")
+    tmp.replace(path)
+    return path
 
 
 def ensure_semstamp_assets() -> str:

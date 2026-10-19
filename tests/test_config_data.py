@@ -156,3 +156,34 @@ def test_stable_seed_is_deterministic_and_distinct():
     assert stable_seed(0, "c4", "c4-1", "KGW") == stable_seed(0, "c4", "c4-1", "KGW")
     assert stable_seed(0, "c4", "c4-1", "KGW") != stable_seed(0, "c4", "c4-1", "PF")
     assert stable_seed(1, "c4", "c4-1", "KGW") != stable_seed(0, "c4", "c4-1", "KGW")
+
+
+def test_math_prompt_templates():
+    chat = PromptTemplates(chat=True).math("What is 2 + 2?")
+    assert chat.startswith("What is 2 + 2?") and chat.endswith("put your final answer within \\boxed{}.")
+    base = PromptTemplates(chat=False).math("What is 2 + 2?")
+    assert base == "Question: What is 2 + 2?\nAnswer: Let's think step by step."
+
+
+def test_postprocess_math_extracts_the_final_number():
+    assert postprocess("math", "So she earns 9 * 2 = 18 dollars. \\boxed{18}") == "18"
+    assert postprocess("math", "Total: \\boxed{1,234} and then 7") == "1234"  # boxed wins over later numbers
+    assert postprocess("math", "\\boxed{\\$42}") == "42"
+    assert postprocess("math", "\\boxed{-3.5}") == "-3.5"
+    assert postprocess("math", "16 - 3 - 4 = 9\n#### 72") == "72"
+    assert postprocess("math", "The answer is 18.") == "18"
+    assert postprocess("math", "It is 5.\nQuestion: the next one has 99") == "5"  # base model runs on
+    assert postprocess("math", "") == ""
+    assert postprocess("math", "no number here") == ""
+
+
+def test_gsm8k_loading(tmp_path, monkeypatch):
+    monkeypatch.setenv("WMBENCH_ARTIFACTS", str(tmp_path))
+    rows = [{"question": f"Q{i}?", "answer": f"step\n#### {1000 + i:,}"} for i in range(5)]
+    (tmp_path / "gsm8k").mkdir()
+    (tmp_path / "gsm8k" / "test.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    samples = load_task("gsm8k", 3, PromptTemplates(chat=True))
+    assert [s.id for s in samples] == ["gsm8k-0", "gsm8k-1", "gsm8k-2"]
+    assert samples[0].reference == "1000"  # comma removed
+    assert samples[1].task_prompt.startswith("Q1?")
+    assert samples[0].human_text is None

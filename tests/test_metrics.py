@@ -113,3 +113,22 @@ def test_extract_continuation():
     assert extract_continuation("Hello world, this is new", " Hello world,") == " this is new"
     # tokenization changed whitespace: fall back to word-count truncation
     assert extract_continuation("Hello  world, this is new", "Hello world,") == "this is new"
+
+
+def test_math_answer_correct():
+    assert metrics.math_answer_correct("18", "18")
+    assert metrics.math_answer_correct("18.0", "18")
+    assert not metrics.math_answer_correct("17", "18")
+    assert not metrics.math_answer_correct("", "18")
+    assert not metrics.math_answer_correct(None, "18")
+
+
+def test_paired_bootstrap_rel_ci():
+    rng = np.random.default_rng(0)
+    b = rng.uniform(1.0, 2.0, size=400)
+    lo, hi = metrics.paired_bootstrap_rel_ci(0.8 * b, b)  # exactly 20% lower on every pair
+    assert lo == pytest.approx(-20.0) and hi == pytest.approx(-20.0)
+    noisy = b + rng.normal(0, 0.1, size=400)
+    lo, hi = metrics.paired_bootstrap_rel_ci(noisy, b)
+    assert lo < 0 < hi
+    assert all(math.isnan(x) for x in metrics.paired_bootstrap_rel_ci([1.0], [1.0]))

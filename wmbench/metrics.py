@@ -166,6 +166,16 @@ def humaneval_passes(prompt: str, completion: str, test: str, entry_point: str, 
     return proc.returncode == 0
 
 
+def math_answer_correct(prediction: str | None, gold: str | None, tol: float = 1e-6) -> bool:
+    """True when the extracted final number equals the gold number (compared as floats)."""
+    if not prediction or not gold:
+        return False
+    try:
+        return abs(float(prediction) - float(gold)) <= tol
+    except ValueError:
+        return False
+
+
 def clean_code_completion(text: str) -> str:
     """Keep the first function body (MarkLLM's ``CodeGenerationTextEditor`` rule)."""
     text = text.lstrip("\n")
@@ -307,6 +317,28 @@ def paired_bootstrap_ci(a, b, stat=np.mean, n_boot: int = 1000, seed: int = 0, a
     idx = rng.integers(0, len(a), size=(n_boot, len(a)))
     deltas = np.asarray([stat(a[i]) - stat(b[i]) for i in idx])
     return float(np.quantile(deltas, alpha / 2)), float(np.quantile(deltas, 1 - alpha / 2))
+
+
+def paired_bootstrap_rel_ci(a, b, n_boot: int = 1000, seed: int = 0, alpha: float = 0.05) -> tuple[float, float]:
+    """CI of the relative change ``(mean(a) / mean(b) - 1) * 100`` in percent, resampling matched pairs.
+
+    ``b`` is the baseline. Resamples whose baseline mean is 0 are skipped.
+    """
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+    a, b = a[mask], b[mask]
+    if len(a) < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(a), size=(n_boot, len(a)))
+    changes = []
+    for i in idx:
+        base = b[i].mean()
+        if base != 0:
+            changes.append((a[i].mean() / base - 1) * 100)
+    if len(changes) < 2:
+        return float("nan"), float("nan")
+    return float(np.quantile(changes, alpha / 2)), float(np.quantile(changes, 1 - alpha / 2))
 
 
 def detection_bootstrap(pos_scores, neg_scores, target_fpr: float = 0.01, n_boot: int = 500, seed: int = 0

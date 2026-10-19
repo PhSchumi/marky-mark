@@ -20,7 +20,7 @@ Stages:
                    and the ``none`` continuations of every sample at one common token budget
                    (plus the ``attacked:<name>`` texts from stage ``attack``). Needs the ``none``
                    generations and the variant's generations, so it runs after the ``generate`` array.
-* ``quality``      PPL (oracle), diversity, BLEU, ROUGE, pass@1 for every variant (+ human row).
+* ``quality``      PPL (oracle), diversity, BLEU, ROUGE, pass@1, GSM8K accuracy for every variant (+ human row).
 * ``report``       pure pandas over the JSONL files.
 """
 
@@ -547,6 +547,9 @@ class Runner:
                 elif task.kind == "code":
                     ref = rec["reference"]
                     out.update(passed=metrics.humaneval_passes(ref["task"], rec["answer"], ref["test"], ref["entry_point"]))
+                elif task.kind == "math":
+                    out.update(correct=metrics.math_answer_correct(rec["answer"], rec["reference"]),
+                               answer=rec["answer"], gold=rec["reference"])
             except Exception as exc:  # noqa: BLE001
                 out["error"] = f"{type(exc).__name__}: {exc}"
             store.write(out)
