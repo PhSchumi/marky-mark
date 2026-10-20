@@ -61,6 +61,9 @@ class BenchmarkConfig:
         "c4": 500, "wmt16_de_en": 200, "cnn_dailymail": 100, "humaneval": 164})
     max_new_tokens: dict[str, int] = field(default_factory=lambda: {
         "c4": 200, "wmt16_de_en": 64, "cnn_dailymail": 96, "humaneval": 300})
+    # Answers per GSM8K question, each with its own seed. The report averages them per question,
+    # so accuracy becomes "share of correct answers" and the bootstrap resamples whole questions.
+    gsm8k_repeats: int = 1
     seed: int = 0
     shuffle_seed: int | None = None  # None = first n rows (MarkLLM convention)
     # --- prompts ----------------------------------------------------------------------
@@ -102,8 +105,9 @@ class BenchmarkConfig:
     # Attack settings are excluded too: every attack row carries its own `attack_config_hash`, so a
     # changed paraphraser regenerates exactly the affected rows (word_deletion_ratio stays in the hash
     # so run directories created before the attack track keep their hash).
+    # gsm8k_repeats only adds samples (like n_samples), so it is excluded as well.
     _HASH_EXCLUDED = ("run_name", "results_root", "target_fprs", "smoke", "oracle_model_name",
-                      "min_detect_tokens", "variants", "datasets", "n_samples", "run_robustness",
+                      "min_detect_tokens", "variants", "datasets", "n_samples", "gsm8k_repeats", "run_robustness",
                       "device", "dtype", "attacks", "dipper_model", "dipper_tokenizer", "dipper_lex_diversity",
                       "dipper_order_diversity", "dipper_sent_interval", "dipper_dtype", "attack_similarity_model")
 

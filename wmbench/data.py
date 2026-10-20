@@ -208,16 +208,32 @@ def _read_jsonl(path: Path, limit: int | None = None) -> list[dict]:
     return rows
 
 
+_REPEAT_SUFFIX = re.compile(r"-r\d+$")
+
+
+def question_id(sample_id: str) -> str:
+    """The question a GSM8K sample answers: ``gsm8k-12-r2`` -> ``gsm8k-12``; ``gsm8k-12`` stays as it is."""
+    return _REPEAT_SUFFIX.sub("", sample_id)
+
+
 def load_task(name: str, n_samples: int, templates: PromptTemplates | None = None, *,
-              markllm_root: Path | None = None, shuffle_seed: int | None = None) -> list[Sample]:
+              markllm_root: Path | None = None, shuffle_seed: int | None = None, repeats: int = 1) -> list[Sample]:
     """Load ``n_samples`` prompts for a task.
 
     By default the first ``n_samples`` rows are used (MarkLLM convention). With
     ``shuffle_seed`` a seeded random subset is drawn instead. Few-shot demonstrations for
     translation are the *last* ``translation_shots`` rows of the (optionally shuffled) file,
     reserved before the evaluated slice is taken, so prompts do not depend on ``n_samples``.
+
+    ``repeats`` (GSM8K only) asks every question several times. The first answer keeps the id
+    ``gsm8k-<i>``, the extra ones are ``gsm8k-<i>-r1``, ``gsm8k-<i>-r2``, ... Each id gets its own
+    generation seed, so the answers are independent draws for the same prompt.
     """
     spec = TASKS[name]
+    if repeats < 1:
+        raise ValueError(f"repeats must be >= 1, got {repeats}")
+    if repeats > 1 and spec.kind != "math":
+        raise ValueError(f"repeats are only supported for gsm8k, not {name}")
     templates = templates or PromptTemplates()
     if spec.kind == "math":
         path = ensure_gsm8k()
@@ -259,7 +275,10 @@ def load_task(name: str, n_samples: int, templates: PromptTemplates | None = Non
                                   {"task": prompt, "test": r["test"], "entry_point": r["entry_point"]},
                                   r.get("canonical_solution")))
     elif spec.kind == "math":
-        for i, r in enumerate(chosen):
-            samples.append(Sample(f"gsm8k-{i}", templates.math(r["question"]), gsm8k_gold(r["answer"]),
-                                  None, {"solution": r["answer"]}))
+        # Repeat by repeat, so a run that stops early still has whole rounds over all questions.
+        for repeat in range(repeats):
+            for i, r in enumerate(chosen):
+                sample_id = f"gsm8k-{i}" if repeat == 0 else f"gsm8k-{i}-r{repeat}"
+                samples.append(Sample(sample_id, templates.math(r["question"]), gsm8k_gold(r["answer"]),
+                                      None, {"solution": r["answer"]}))
     return samples
