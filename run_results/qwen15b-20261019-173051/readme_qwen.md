@@ -34,3 +34,57 @@ The figures for this run are in the Qwen section of `../plots_tables.ipynb`.
 - **Overall:** SynthID and MorphMark cost nothing measurable on any task. KGW and SIR hurt math and summarization, and SIR also hurts translation.
 
 "Clear drop" means the 95% confidence interval of the paired change (same prompts, bootstrap) does not include zero. All numbers come from `summary.csv`, `paired_deltas.csv` and `detection_summary.csv` in this folder.
+
+## How the GSM8K accuracy change is computed
+
+This is the x-axis of the Qwen Figure 2 in `../plots_tables.ipynb` (`rel_change_pct` for `gsm8k` in `paired_deltas.csv`). Recomputing KGW from the per-question files in `quality/gsm8k/` gives exactly the reported −16.05% with CI [−22.71%, −8.41%].
+
+### From questions to the accuracy change
+
+**Step 1: Pick the questions** (`wmbench/data.py`, `load_task`)
+- The GSM8K test set (1,319 problems) is downloaded once from OpenAI's repository, at a fixed version that is checked against a known hash (`bootstrap.py`, `ensure_gsm8k`).
+- The first 500 problems are used, the same 500 for every method.
+- The "gold" answer is the number after `####` in the official solution, with commas removed (`gsm8k_gold`).
+
+**Step 2: Build the prompt**
+- Qwen is a chat model, so the prompt goes through its chat template: the question, then "Please reason step by step, and put your final answer within \boxed{}."
+- The prompt is identical for every method.
+
+**Step 3: Generate one answer per question per method** (`wmbench/generation.py`)
+- Each method writes up to 512 new tokens, using plain sampling at temperature 1.
+- Each generation gets its own random seed, computed from (run seed, task, question id, method name). Since the method name is part of it, the unwatermarked and KGW answers to the same question use different random draws. This is part of why 24–32% of answers flip between the unwatermarked and watermarked runs, which makes the intervals wide.
+
+**Step 4: Pull out the final number** (`extract_math_answer`)
+- First choice: the number in the last `\boxed{...}`.
+- Otherwise: the first number after `####`.
+- Otherwise: the last number in the text.
+- Commas are removed, so `1,234` becomes `1234`.
+
+**Step 5: Score each answer** (`metrics.math_answer_correct`)
+- Correct (1) if the extracted number equals the gold number when compared as decimals, otherwise wrong (0).
+- No number found also counts as wrong.
+
+**Step 6: Pair the answers** (`report.py`, `paired_deltas`)
+- Keep only questions that ran without error for both the unwatermarked model and the method. Here that is all 500.
+- This gives two lists of 0s and 1s in the same question order: `b` (unwatermarked) and `a` (watermarked).
+
+**Step 7: Compute the change**
+- Accuracy without watermark = mean of `b`. For Qwen that is 0.648.
+- Accuracy with watermark = mean of `a`. For KGW that is 0.544.
+- Relative change = (0.544 / 0.648 − 1) × 100 = **−16.05%**. This is `rel_change_pct`, the x-value in Figure 2.
+- The file also has an absolute change, `delta_vs_none`: mean of (a − b) = −0.104, i.e. −10.4 percentage points.
+
+### The 95% CI (paired bootstrap)
+
+The code is `metrics.paired_bootstrap_rel_ci`.
+
+1. **Resample questions, keeping pairs together.** Draw 500 question indices at random, with replacement, so some questions appear twice and some not at all. Each drawn question brings both of its answers (`a[i]` and `b[i]`). That is what "paired" means here.
+2. **Recompute the change on the resample:** (mean of resampled `a` / mean of resampled `b` − 1) × 100.
+3. **Repeat 1,000 times.** This gives 1,000 plausible values of the change.
+4. **Take the 2.5th and 97.5th percentiles.** These are the CI bounds, **[−22.7%, −8.4%]** for KGW.
+
+### Details worth knowing
+- **Same resamples for every method.** The bootstrap random generator always starts from seed 0, and every method has 500 questions, so all five methods are resampled with the same sets of questions. The intervals are reproducible and comparable across methods.
+- **Why pairing matters.** Questions differ a lot in difficulty, and resampling pairs together keeps that difference out of the interval. Only questions where the two answers differ widen it.
+- **Rare skip.** A resample whose unwatermarked accuracy is exactly 0 would be skipped, to avoid dividing by zero. That never happens at 65% accuracy.
+- **Where the absolute interval comes from.** `ci_low` / `ci_high` in `paired_deltas.csv` are built the same way, but on the difference of means instead of the ratio.
