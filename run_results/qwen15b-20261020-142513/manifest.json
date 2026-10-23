@@ -1,0 +1,189 @@
+{
+  "schema_version": 2,
+  "run_name": "qwen15b-20261020-142513",
+  "config": {
+    "run_name": "qwen15b-20261020-142513",
+    "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+    "tokenizer_name": null,
+    "trust_remote_code": false,
+    "oracle_model_name": "Qwen/Qwen2.5-7B-Instruct",
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "use_chat_template": null,
+    "system_prompt": null,
+    "variants": [
+      "none",
+      "KGW",
+      "MorphMark",
+      "PF",
+      "SynthID",
+      "SIR"
+    ],
+    "datasets": [
+      "c4",
+      "wmt16_de_en",
+      "cnn_dailymail",
+      "gsm8k"
+    ],
+    "n_samples": {
+      "c4": 500,
+      "wmt16_de_en": 200,
+      "cnn_dailymail": 100,
+      "humaneval": 164,
+      "gsm8k": 1319
+    },
+    "max_new_tokens": {
+      "c4": 200,
+      "wmt16_de_en": 64,
+      "cnn_dailymail": 96,
+      "humaneval": 300,
+      "gsm8k": 512
+    },
+    "gsm8k_repeats": 1,
+    "seed": 0,
+    "shuffle_seed": null,
+    "translation_shots": 5,
+    "article_max_words": 400,
+    "min_detect_tokens": 50,
+    "target_fprs": [
+      0.01,
+      0.05
+    ],
+    "run_robustness": true,
+    "attacks": [
+      "word_deletion",
+      "dipper"
+    ],
+    "word_deletion_ratio": 0.3,
+    "dipper_model": "kalpeshk2011/dipper-paraphraser-xxl",
+    "dipper_tokenizer": "google/t5-v1_1-xxl",
+    "dipper_lex_diversity": 60,
+    "dipper_order_diversity": 0,
+    "dipper_sent_interval": 1,
+    "dipper_dtype": "auto",
+    "attack_similarity_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "semstamp_n_max": 100,
+    "watermark_overrides": {},
+    "results_root": "/home/berger/wmbench/results",
+    "smoke": false
+  },
+  "config_hash": "8a54ca9d6d84",
+  "markllm_commit": "0a4fe8c642b31b8a8c4993615b1c70a0c300d918",
+  "wmbench_version": "0.1.0",
+  "repo_git_sha": "b311d62516f31640683df4b017aba7ec10226b8b",
+  "environment": {
+    "device_type": "cuda",
+    "dtype": "bfloat16",
+    "torch_version": "2.6.0+cu124",
+    "transformers_version": "5.20.1",
+    "python": "3.13.13",
+    "hostname": "tcml-node4",
+    "slurm_job_id": "2358285",
+    "slurm_array_task_id": null
+  },
+  "resolved": {
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "chat_template": true,
+    "oracle_model_name": "Qwen/Qwen2.5-7B-Instruct"
+  },
+  "created": "2026-10-20T14:26:31",
+  "updated": "2026-10-21T05:17:14",
+  "stages_run": [
+    {
+      "stage": "generate",
+      "time": "2026-10-21T03:22:18",
+      "slurm": "2358285",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail",
+        "gsm8k"
+      ]
+    },
+    {
+      "stage": "attack",
+      "time": "2026-10-21T05:06:41",
+      "slurm": "2358285",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail",
+        "gsm8k"
+      ]
+    },
+    {
+      "stage": "detect",
+      "time": "2026-10-21T05:13:48",
+      "slurm": "2358285",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail",
+        "gsm8k"
+      ]
+    },
+    {
+      "stage": "quality",
+      "time": "2026-10-21T05:16:48",
+      "slurm": "2358285",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail",
+        "gsm8k"
+      ]
+    },
+    {
+      "stage": "report",
+      "time": "2026-10-21T05:17:14",
+      "slurm": "2358285",
+      "variants": [
+        "none",
+        "KGW",
+        "MorphMark",
+        "PF",
+        "SynthID",
+        "SIR"
+      ],
+      "datasets": [
+        "c4",
+        "wmt16_de_en",
+        "cnn_dailymail",
+        "gsm8k"
+      ]
+    }
+  ]
+}

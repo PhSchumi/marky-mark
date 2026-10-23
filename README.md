@@ -143,14 +143,15 @@ regenerates exactly the affected records. Results land in
 
 `scripts/slurm/qwen_full.sbatch` runs the whole study on `Qwen/Qwen2.5-1.5B-Instruct` (bf16) with
 `Qwen/Qwen2.5-7B-Instruct` as perplexity oracle: all five watermarks plus `none`, C4 / WMT16 /
-CNN-DailyMail, 500 GSM8K math problems, and the word-deletion and DIPPER attacks. Submit it from the repo
-root on the cluster:
+CNN-DailyMail, all 1,319 GSM8K test problems, and the word-deletion and DIPPER attacks. It runs on the
+`L40Sday` partition. Submit it from the repo root on the cluster:
 
 ```bash
 git pull && sbatch scripts/slurm/qwen_full.sbatch
 ```
 
-It takes roughly 15-18 h on one L40S. Fifteen minutes before the 20 h limit it resubmits itself (at most
+With one answer per GSM8K problem it takes roughly 15 h on one L40S. `GSM8K_REPEATS=3 sbatch ...` asks
+every problem 3 times (about 36 h), and `GSM8K_N=500` reproduces the first Qwen run. Fifteen minutes before the 20 h limit it resubmits itself (at most
 three times) and resumes from the cached records. At the end it packs the run into
 `~/wmbench/results/qwen15b-<timestamp>.tar.gz` and prints the `scp` command to download it. The headline
 file is `degradation.csv`: per task and watermark the unwatermarked value, the watermarked value and the %
@@ -199,7 +200,7 @@ variables (`WMBENCH_*`, see `BenchmarkConfig.from_env`) are applied on top of `-
 | BLEU | sacreBLEU corpus BLEU of the post-processed answer vs the WMT16 reference (first line, `German:` cue stripped); mean sentence BLEU + CI too | `quality/wmt16_de_en` |
 | ROUGE-1/2/L | `rouge_score` F-measure with stemming vs CNN/DailyMail highlights (first paragraph of the answer) | `quality/cnn_dailymail` |
 | pass@1 | HumanEval unit tests executed in a subprocess with a timeout (optional; `--datasets ...,humaneval`) | `quality/humaneval` |
-| GSM8K accuracy | share of math problems whose final number (last `\boxed{}`, else after `####`, else the last number) equals the gold answer; zero-shot chain-of-thought prompt; test split from OpenAI's repository at a pinned commit (optional; `--datasets ...,gsm8k`) | `quality/gsm8k` |
+| GSM8K accuracy | share of math problems whose final number (last `\boxed{}`, else after `####`, else the last number) equals the gold answer; zero-shot chain-of-thought prompt; test split from OpenAI's repository at a pinned commit (optional; `--datasets ...,gsm8k`). With `--gsm8k-repeats k` every problem is answered k times (ids `gsm8k-<i>`, `gsm8k-<i>-r1`, ...); each problem is then scored by its share of correct answers, and the bootstrap resamples whole problems | `quality/gsm8k` |
 | % change vs `none` | `mean(variant) / mean(none) - 1` on the same prompts with a paired bootstrap 95% CI; for perplexity the ratio of geometric means | `degradation.csv`, `paired_deltas.csv` |
 | AUROC | watermarked vs negative scores; negatives = human C4 continuations (`_human`) or `none` generations (`_none`) | `detection_summary.csv` |
 | TPR@1%FPR, TPR@5%FPR | threshold = the score exceeded by at most 1% (5%) of negatives; needs >= 100 negatives, flagged otherwise | idem |

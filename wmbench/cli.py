@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--datasets", help="comma list, e.g. c4,wmt16_de_en")
     p.add_argument("--n-samples", help="int applied to every dataset, or JSON object per dataset")
     p.add_argument("--max-new-tokens", help="int applied to every dataset, or JSON object per dataset")
+    p.add_argument("--gsm8k-repeats", type=int,
+                   help="answers per GSM8K question (own seed each); the report averages them per question")
     p.add_argument("--device", help="cuda | cuda:0 | mps | cpu | auto")
     p.add_argument("--dtype", help="auto | float16 | bfloat16 | float32")
     p.add_argument("--seed", type=int)
@@ -77,6 +79,8 @@ def config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         upd["n_samples"] = _int_or_json(args.n_samples, cfg.n_samples)
     if args.max_new_tokens:
         upd["max_new_tokens"] = _int_or_json(args.max_new_tokens, cfg.max_new_tokens)
+    if args.gsm8k_repeats is not None:
+        upd["gsm8k_repeats"] = args.gsm8k_repeats
     if args.device:
         upd["device"] = args.device
     if args.dtype:

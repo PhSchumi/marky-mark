@@ -157,6 +157,30 @@ def test_gsm8k_accuracy_and_degradation_table(synthetic_run):
     assert "Quality degradation vs. unwatermarked" in (cfg.run_dir / "summary.md").read_text()
 
 
+def test_gsm8k_repeats_are_averaged_per_question(synthetic_run):
+    # 4 questions, 2 answers each. none: 3 + 2 of 4 questions right -> 5/8; KGW: 2 + 1 -> 3/8.
+    cfg = synthetic_run.with_updates(datasets=("c4", "gsm8k"), variants=("none", "KGW"), gsm8k_repeats=2)
+    correct = {"none": [[True, True, True, False], [True, True, False, False]],
+               "KGW": [[True, True, False, False], [True, False, False, False]]}
+    for variant, rounds in correct.items():
+        rows = []
+        for repeat, answers in enumerate(rounds):
+            for i, ok in enumerate(answers):
+                sample_id = f"gsm8k-{i}" if repeat == 0 else f"gsm8k-{i}-r{repeat}"
+                rows.append({"sample_id": sample_id, "dataset": "gsm8k", "variant": variant, "error": None,
+                             "correct": ok})
+        _write(cfg.run_dir / "quality" / "gsm8k" / f"{variant}.jsonl", rows)
+    out = build_report(cfg, plots=False)
+    qt = out["quality"].set_index(["dataset", "variant"])
+    assert qt.loc[("gsm8k", "none"), "accuracy"] == pytest.approx(5 / 8)
+    assert qt.loc[("gsm8k", "none"), "n_questions"] == 4
+    assert qt.loc[("gsm8k", "none"), "answers_per_question"] == pytest.approx(2.0)
+    kgw = out["paired_deltas"].set_index(["dataset", "variant", "metric"]).loc[("gsm8k", "KGW", "accuracy")]
+    assert kgw.n_pairs == 4  # questions, not answers
+    assert kgw.delta_vs_none == pytest.approx(3 / 8 - 5 / 8)
+    assert kgw.rel_change_pct == pytest.approx(-40.0)
+
+
 def test_report_survives_all_error_quality_rows_and_missing_quality(synthetic_run):
     cfg = synthetic_run
     _write(cfg.run_dir / "quality" / "wmt16_de_en" / "KGW.jsonl",

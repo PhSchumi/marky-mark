@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=wmbench-qwen
-#SBATCH --partition=day
+#SBATCH --partition=L40Sday
 #SBATCH --gres=gpu:L40S:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
@@ -12,7 +12,7 @@
 #   generator Qwen/Qwen2.5-1.5B-Instruct, perplexity oracle Qwen/Qwen2.5-7B-Instruct (both bf16),
 #   watermarks KGW, MorphMark, PF, SynthID, SIR + the unwatermarked baseline,
 #   tasks C4 (detection, perplexity, diversity), WMT16 (BLEU), CNN/DailyMail (ROUGE),
-#   GSM8K (500 math problems, final-answer accuracy),
+#   GSM8K (all 1,319 test problems, final-answer accuracy; GSM8K_REPEATS answers per problem),
 #   robustness: word deletion + DIPPER paraphrase on the C4 texts,
 #   and the quality degradation vs. the unwatermarked model (degradation.csv, summary.md).
 #
@@ -20,7 +20,9 @@
 #
 #     git pull && sbatch scripts/slurm/qwen_full.sbatch
 #
-# The full run takes roughly 15-18 h. 15 minutes before the 20 h limit the job resubmits itself
+# With one answer per GSM8K problem the run takes roughly 15 h (the 500-problem run took 8.3 h, of which
+# GSM8K was about 4 h). Every extra answer per problem adds about 10.5 h (GSM8K_REPEATS=3: about 36 h).
+# 15 minutes before the 20 h limit the job resubmits itself
 # (at most MAX_RESUBMITS times) and the new job resumes from the cached records, so one submission
 # is enough. When everything is done the results are packed into
 #     $WMROOT/results/<run>.tar.gz          (default WMROOT: ~/wmbench)
@@ -28,6 +30,8 @@
 #
 # `FRESH=1 sbatch ...` starts a new run even if the last one is unfinished;
 # `RUN=<name> sbatch ...` resumes or starts the run <name>.
+# `GSM8K_REPEATS=3 sbatch ...` asks every GSM8K problem 3 times (own seed each); the report then
+# scores each problem by its share of correct answers. `GSM8K_N=500` reproduces the first Qwen run.
 
 set -euo pipefail
 
@@ -65,7 +69,8 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 
 MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 ORACLE="${ORACLE:-Qwen/Qwen2.5-7B-Instruct}"
-GSM8K_N="${GSM8K_N:-500}"
+GSM8K_N="${GSM8K_N:-1319}"            # 1319 = the whole GSM8K test split
+GSM8K_REPEATS="${GSM8K_REPEATS:-1}"    # answers per GSM8K problem
 
 # Run name. The last run started by this file is kept in $RUN_STATE:
 #   - unfinished (no summary.md yet)        -> resume it
@@ -132,11 +137,13 @@ resubmit() {
 trap resubmit USR1
 
 echo "=== running benchmark: $MODEL (oracle $ORACLE) -> $WMBENCH_RESULTS/$RUN (resubmit $RESUBMITS) ==="
+echo "=== GSM8K: $GSM8K_N problems x $GSM8K_REPEATS answer(s) ==="
 python scripts/run_benchmark.py --preset full \
   --model "$MODEL" --oracle "$ORACLE" --run-name "$RUN" \
   --dtype bfloat16 --device cuda \
   --datasets c4,wmt16_de_en,cnn_dailymail,gsm8k \
   --n-samples "{\"gsm8k\": $GSM8K_N}" --max-new-tokens '{"gsm8k": 512}' \
+  --gsm8k-repeats "$GSM8K_REPEATS" \
   --stage all --robustness \
   --results-root "$WMBENCH_RESULTS" --no-progress "$@" &
 PY_PID=$!

@@ -6,7 +6,7 @@ import pytest
 
 from wmbench import config as config_mod
 from wmbench.config import SAMPLING, BenchmarkConfig, load_config_file, watermark_config_digest
-from wmbench.data import PromptTemplates, load_task, postprocess
+from wmbench.data import PromptTemplates, load_task, postprocess, question_id
 from wmbench.generation import CONTEXT_OVERFLOW, JsonlStore, latest_by_sample, stable_seed
 from wmbench.models import neutralize_generation_config, stop_token_ids
 
@@ -187,3 +187,22 @@ def test_gsm8k_loading(tmp_path, monkeypatch):
     assert samples[0].reference == "1000"  # comma removed
     assert samples[1].task_prompt.startswith("Q1?")
     assert samples[0].human_text is None
+
+
+def test_gsm8k_repeats_add_ids_per_question(tmp_path, monkeypatch):
+    monkeypatch.setenv("WMBENCH_ARTIFACTS", str(tmp_path))
+    rows = [{"question": f"Q{i}?", "answer": f"#### {i}"} for i in range(5)]
+    (tmp_path / "gsm8k").mkdir()
+    (tmp_path / "gsm8k" / "test.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    samples = load_task("gsm8k", 2, PromptTemplates(chat=True), repeats=3)
+    # the first answer keeps the old id, so runs with one answer per question are unchanged
+    assert [s.id for s in samples] == ["gsm8k-0", "gsm8k-1", "gsm8k-0-r1", "gsm8k-1-r1", "gsm8k-0-r2", "gsm8k-1-r2"]
+    assert [question_id(s.id) for s in samples] == ["gsm8k-0", "gsm8k-1"] * 3
+    assert samples[0].task_prompt == samples[2].task_prompt and samples[0].reference == samples[2].reference
+    with pytest.raises(ValueError):
+        load_task("wmt16_de_en", 2, repeats=2)
+
+
+def test_gsm8k_repeats_do_not_change_the_config_hash():
+    cfg = BenchmarkConfig.full()
+    assert cfg.with_updates(gsm8k_repeats=3).config_hash() == cfg.config_hash()

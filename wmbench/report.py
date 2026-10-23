@@ -12,7 +12,7 @@ import pandas as pd
 
 from wmbench import metrics
 from wmbench.config import DETECTION_DATASETS, BenchmarkConfig
-from wmbench.data import TASKS
+from wmbench.data import TASKS, question_id
 from wmbench.generation import is_final_error
 from wmbench.watermarks import VARIANTS
 
@@ -315,11 +315,30 @@ def quality_table(qual: pd.DataFrame, gens: pd.DataFrame, cfg: BenchmarkConfig) 
                 row.update(pass_at_1=float(qok.passed.astype(float).mean()),
                            pass_at_1_ci=_ci(*metrics.bootstrap_ci(qok.passed.astype(float), seed=cfg.seed)))
             elif task.kind == "math":
-                correct = qok.correct.astype(float)
+                correct = per_question_correct(qok)  # one value per question, also when it was asked several times
                 row.update(accuracy=float(correct.mean()),
-                           accuracy_ci=_ci(*metrics.bootstrap_ci(correct, seed=cfg.seed)))
+                           accuracy_ci=_ci(*metrics.bootstrap_ci(correct, seed=cfg.seed)),
+                           n_questions=len(correct), answers_per_question=len(qok) / len(correct))
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def per_question_correct(rows: pd.DataFrame) -> pd.Series:
+    """Share of correct answers per GSM8K question, indexed by question id.
+
+    With one answer per question this is just the 0/1 ``correct`` column. With ``gsm8k_repeats`` > 1
+    the answers ``gsm8k-<i>``, ``gsm8k-<i>-r1``, ... are averaged, e.g. 2 of 3 correct -> 0.67.
+    """
+    questions = rows.sample_id.map(question_id)
+    # sort=False keeps the file order, so the bootstrap draws the same resamples as before repeats existed
+    return rows.correct.astype(float).groupby(questions, sort=False).mean()
+
+
+def _rows_by_sample(rows: pd.DataFrame, dataset: str) -> pd.DataFrame:
+    """Quality rows indexed by sample id; for GSM8K one row per question (its answers averaged)."""
+    if TASKS[dataset].kind == "math" and not rows.empty:
+        return per_question_correct(rows).to_frame("correct")
+    return rows.set_index("sample_id")
 
 
 def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
@@ -328,6 +347,8 @@ def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
     Besides the absolute difference, every row has the relative change in percent
     (``rel_change_pct`` = mean(variant) / mean(none) - 1, with a paired bootstrap CI). For ``log_ppl``
     the means are geometric-mean perplexities and the change is ``exp(delta) - 1``.
+    For GSM8K the pairs are questions: several answers to one question are averaged first, so the
+    bootstrap resamples whole questions and ``n_pairs`` counts questions.
     """
     rows = []
     if qual.empty:
@@ -338,11 +359,11 @@ def paired_deltas(qual: pd.DataFrame, cfg: BenchmarkConfig) -> pd.DataFrame:
              "humaneval": [("pass", "passed", None)],
              "gsm8k": [("accuracy", "correct", None)]}
     for dataset, items in specs.items():
-        base = qual[(qual.dataset == dataset) & (qual.variant == "none") & qual.error.isna()].set_index("sample_id")
+        base = _rows_by_sample(qual[(qual.dataset == dataset) & (qual.variant == "none") & qual.error.isna()], dataset)
         if base.empty:
             continue
         for variant in [v for v in cfg.variants if v != "none"]:
-            q = qual[(qual.dataset == dataset) & (qual.variant == variant) & qual.error.isna()].set_index("sample_id")
+            q = _rows_by_sample(qual[(qual.dataset == dataset) & (qual.variant == variant) & qual.error.isna()], dataset)
             common = base.index.intersection(q.index)
             if len(common) < 2:
                 continue
@@ -592,7 +613,9 @@ def build_report(cfg: BenchmarkConfig, *, plots: bool = True) -> dict:
            f"(see `fpr_warning_*` in detection_summary.csv).", ""]
     md += ["## Quality degradation vs. unwatermarked (%)", "",
            "Same prompts for every variant. `change_pct` = watermarked / unwatermarked - 1, with a paired "
-           "bootstrap 95% CI. `better` says which direction is an improvement (perplexity: lower).", "",
+           "bootstrap 95% CI. `better` says which direction is an improvement (perplexity: lower). "
+           f"GSM8K: {cfg.gsm8k_repeats} answer(s) per question, averaged per question before pairing, "
+           "so the bootstrap resamples whole questions.", "",
            df_to_markdown(dg), ""]
     md += ["## Detection", "", df_to_markdown(dt), "", "## Quality per dataset", "", df_to_markdown(qt), "",
            "## Paired differences vs `none` (same prompts, bootstrap 95% CI)", "", df_to_markdown(pdlt), ""]

@@ -375,8 +375,9 @@ class Runner:
 
     def samples(self, dataset: str) -> list[Sample]:
         if dataset not in self._samples:
+            repeats = self.cfg.gsm8k_repeats if dataset == "gsm8k" else 1
             self._samples[dataset] = load_task(dataset, self.cfg.n_samples[dataset], self.templates,
-                                               shuffle_seed=self.cfg.shuffle_seed)
+                                               shuffle_seed=self.cfg.shuffle_seed, repeats=repeats)
         return self._samples[dataset]
 
     def variant_names_for(self, dataset: str, variants=None) -> list[str]:
