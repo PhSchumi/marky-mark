@@ -1,4 +1,4 @@
-# marky-mark: pipeline audit for the paper (run `run_results/opt13b`)
+# marky-mark: pipeline audit for the paper (run `archive/opt13b`, formerly `run_results/opt13b`)
 
 The numbers in the results section match what the code produces. To check, they were rebuilt from the
 per-sample records with `scripts/paper_assets.py`; the script's built-in cross-checks against `summary.md`

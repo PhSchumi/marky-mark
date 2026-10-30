@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Paper-ready LaTeX tables and PDF figures for one wmbench run.
 
-    python scripts/paper_assets.py --run run_results/opt13b --out paper --compile
+    python scripts/paper_assets.py --run run_results/qwen15b-20261020-142513 --out paper --compile
 
 Writes ``<out>/tables/*.tex`` (booktabs floats with draft captions), ``<out>/figures/*.pdf`` (vector,
 TrueType fonts embedded) each with a ``.tex`` float snippet and a ``.png`` preview, ``<out>/numbers.json``
@@ -1466,7 +1466,7 @@ def compile_gallery(tex: Path) -> bool:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--run", type=Path, default=REPO / "run_results" / "opt13b", help="results directory of one run")
+    ap.add_argument("--run", type=Path, default=REPO / "run_results" / "qwen15b-20261020-142513", help="results directory of one run")
     ap.add_argument("--out", type=Path, default=REPO / "paper", help="output directory")
     ap.add_argument("--font", choices=("sans", "serif"), default="sans", help="figure font (sans: Arial)")
     ap.add_argument("--compile", action="store_true", help="build preview.pdf with tectonic")

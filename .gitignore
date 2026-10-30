@@ -25,3 +25,6 @@ paper/
 .DS_Store
 .vscode/
 .idea/
+
+# Advisory lock file wmbench creates in every run directory
+.manifest.lock

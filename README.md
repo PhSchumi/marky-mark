@@ -16,8 +16,9 @@ nodes) with a narrated Jupyter notebook on top.
 | `SIR` | semantic invariant robust logit bias | mean bias similarity | Liu et al., ICLR 2024, [2310.06356](https://arxiv.org/abs/2310.06356) |
 | `SemStamp` (optional) | sentence-level semantic rejection sampling | z-score | Hou et al., NAACL 2024, [2310.03991](https://arxiv.org/abs/2310.03991) |
 
-The placeholder model is `facebook/opt-1.3b` (MarkLLM's reference model). Swap it via `--model`,
-`WMBENCH_MODEL`, or the first config cell of the notebook.
+The placeholder model is `facebook/opt-1.3b` (MarkLLM's reference model); the paper's results use
+`Qwen/Qwen2.5-1.5B-Instruct` (see "Results of this study"). Swap it via `--model`, `WMBENCH_MODEL`, or
+the first config cell of the notebook.
 
 ## Contents
 
@@ -43,31 +44,71 @@ scripts/slurm/*.sbatch                single job, array-over-variants + merge, h
 tests/                                pytest (fast unit tests; `-m slow` integration tests with opt-125m)
 docs/plans/                           design document and review notes
 run_results/                          the results reported in the paper (see "Results of this study")
+archive/opt13b/                       the preliminary OPT-1.3B run, its summary and audit
 ```
 
 Runtime artifacts (`third_party/MarkLLM`, `artifacts/`, `results/`) are git-ignored.
 
 ## Results of this study
 
-The runs behind the paper are committed under `run_results/` (copied from the cluster's `results/`):
+The runs are committed as copies of the cluster's `results/`:
 
 | directory | run | contents |
 |---|---|---|
-| `run_results/opt13b/` | `scripts/slurm/all_in_one_robustness.sbatch`, OPT-1.3B, oracle OPT-2.7B | **the reported run**: clean detection, quality, speed, and the word-deletion and DIPPER attacks |
-| `run_results/opt13b_clean/` | the same configuration without the attack stage | an earlier run; its clean results are identical to `opt13b/` |
+| `run_results/qwen15b-20261020-142513/` | `scripts/slurm/qwen_full.sbatch`, Qwen2.5-1.5B-Instruct, oracle Qwen2.5-7B-Instruct | **the run reported in the paper**: clean detection, quality on C4 / WMT16 / CNN-DailyMail / GSM8K, speed, and the word-deletion and DIPPER attacks |
+| `archive/opt13b/` | `scripts/slurm/all_in_one_robustness.sbatch`, OPT-1.3B, oracle OPT-2.7B | the preliminary run (no GSM8K); clean detection was at ceiling for every method. `results_summary.md` summarises it, `marky-mark_pipeline_audit.md` is the audit of its numbers, and `sem_stamp_run/` holds the separate SemStamp run |
 
-Start with `run_results/opt13b/summary.md`. The per-sample records (`generations/`, `attacks/`,
-`detection/`, `quality/`) let every number be recomputed with `--stage report`. The paper's tables,
-figures and quoted numbers come from
+Start with `run_results/qwen15b-20261020-142513/summary.md`. The per-sample records (`generations/`,
+`attacks/`, `detection/`, `quality/`) let every number be recomputed with `--stage report`. Figures 1 and 2
+of the paper come from `run_results/plots_tables.ipynb` (written to `run_results/plots/`); the tables and
+the quoted robustness statistics (detection margin, retained margin, context survival, effective FPR) come
+from
 
 ```bash
-python scripts/paper_assets.py --run run_results/opt13b --out paper --compile
+python scripts/paper_assets.py --run run_results/qwen15b-20261020-142513 --out paper --compile
 ```
 
 which writes `paper/tables/`, `paper/figures/`, `paper/numbers.json` (clean detection, quality, cost),
 `paper/numbers_robustness.json` (statistics under attack) and a gallery `paper/preview.pdf`. The
 context-survival and SIR-truncation statistics load the generator and SIR-embedder tokenizers from the
 Hugging Face hub (or `HF_HOME`) and are skipped with a warning when these are unavailable.
+
+## Reproducibility
+
+Every number and figure in the paper can be recomputed from the committed per-sample records, without a
+GPU. This was checked on 2026-10-30:
+
+| paper content | how to regenerate | result |
+|---|---|---|
+| Table 2 and the other numbers from `summary.md` / `*.csv` (quality, speed, attack strength, shipped thresholds) | report stage on a copy of the run (below) | identical up to floating-point rounding in the last digit |
+| Table 1, confidence intervals, context survival, effective FPR, SIR context truncation | `python scripts/paper_assets.py --out paper` | identical (the bootstraps are seeded) |
+| Figures 1 and 2 | execute `run_results/plots_tables.ipynb` | pixel-identical |
+
+The report stage writes into the run directory, so run it on a copy:
+
+```bash
+mkdir -p /tmp/rerun && cp -R run_results/qwen15b-20261020-142513 /tmp/rerun/
+python -c "import json; json.dump(json.load(open('/tmp/rerun/qwen15b-20261020-142513/manifest.json'))['config'], open('/tmp/rerun/cfg.json', 'w'))"
+python scripts/run_benchmark.py --config /tmp/rerun/cfg.json --results-root /tmp/rerun --stage report --allow-device-mismatch
+```
+
+`--allow-device-mismatch` is safe here because the report stage does not re-run any detector. Both the
+report stage and `paper_assets.py` load the Qwen2.5 tokenizer from the Hugging Face hub (or `HF_HOME`).
+
+Re-running the experiment itself (`scripts/slurm/qwen_full.sbatch`, see 4b) uses the same per-sample
+seeds and the pinned MarkLLM commit, but reproduces the texts bit for bit only in the original
+environment, which `manifest.json` and every record store:
+
+* code: commit `b311d62`. Later commits only add the optional `--gsm8k-repeats`, whose default produces
+  the same samples.
+* MarkLLM `0a4fe8c6`, Python 3.13.13, torch 2.6.0+cu124, transformers 5.20.1, CUDA in bfloat16, one SLURM
+  job on `tcml-node4` (`L40Sday` partition).
+* models: `Qwen/Qwen2.5-1.5B-Instruct`, oracle `Qwen/Qwen2.5-7B-Instruct`, attacker
+  `kalpeshk2011/dipper-paraphraser-xxl`. Their Hub revisions are not recorded.
+
+`requirements.txt` only sets lower bounds, and bfloat16 sampling on a GPU is not bit-exact across GPU
+models or library versions. A re-run elsewhere therefore produces slightly different texts, and the
+numbers should vary within about their confidence intervals.
 
 ## Quickstart
 
